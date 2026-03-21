@@ -1,12 +1,11 @@
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiResponse
 
+from utils.api_response import success_response, error_response
 from .serializers import (
     UserRegistrationSerializer,
     UserLoginSerializer,
@@ -40,16 +39,16 @@ class RegisterView(APIView):
         
         if serializer.is_valid():
             user = serializer.save()
-            return Response({
-                'success': True,
-                'message': 'Registration successful'
-            }, status=status.HTTP_201_CREATED)
+            return success_response(
+                message='Registration successful',
+                status_code=status.HTTP_201_CREATED
+            )
         
-        return Response({
-            'success': False,
-            'message': 'Registration failed',
-            'errors': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return error_response(
+            message='Registration failed',
+            errors=serializer.errors,
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
 
 class LoginView(APIView):
     permission_classes = [AllowAny]
@@ -84,17 +83,17 @@ class LoginView(APIView):
         
         if serializer.is_valid():
             tokens = serializer.validated_data['tokens']
-            return Response({
-                'success': True,
-                'message': 'Login successful',
-                'data': tokens
-            }, status=status.HTTP_200_OK)
+            return success_response(
+                data=tokens,
+                message='Login successful',
+                status_code=status.HTTP_200_OK
+            )
         
-        return Response({
-            'success': False,
-            'message': 'Login failed',
-            'errors': serializer.errors
-        }, status=status.HTTP_401_UNAUTHORIZED)
+        return error_response(
+            message='Login failed',
+            errors=serializer.errors,
+            status_code=status.HTTP_401_UNAUTHORIZED
+        )
 
 class TokenRefreshView(APIView):
     permission_classes = [AllowAny]
@@ -128,20 +127,20 @@ class TokenRefreshView(APIView):
         serializer = TokenRefreshSerializer(data=request.data)
         
         if serializer.is_valid():
-            return Response({
-                'success': True,
-                'message': 'Token refreshed successfully',
-                'data': {
+            return success_response(
+                data={
                     'access': serializer.validated_data['access'],
                     'refresh': serializer.validated_data.get('refresh', request.data.get('refresh')),
-                }
-            }, status=status.HTTP_200_OK)
+                },
+                message='Token refreshed successfully',
+                status_code=status.HTTP_200_OK
+            )
         
-        return Response({
-            'success': False,
-            'message': 'Token refresh failed',
-            'errors': serializer.errors
-        }, status=status.HTTP_401_UNAUTHORIZED)
+        return error_response(
+            message='Token refresh failed',
+            errors=serializer.errors,
+            status_code=status.HTTP_401_UNAUTHORIZED
+        )
 
 class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
@@ -163,16 +162,16 @@ class LogoutView(APIView):
                 token = RefreshToken(refresh_token)
                 token.blacklist()
             
-            return Response({
-                'success': True,
-                'message': 'Logout successful'
-            }, status=status.HTTP_200_OK)
+            return success_response(
+                message='Logout successful',
+                status_code=status.HTTP_200_OK
+            )
         except Exception as e:
-            return Response({
-                'success': False,
-                'message': 'Logout failed',
-                'errors': {'detail': str(e)}
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(
+                message='Logout failed',
+                errors={'detail': str(e)},
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
 
 class MeView(APIView):
     """
@@ -198,22 +197,18 @@ class MeView(APIView):
         cached_user = CacheService.get(cache_key)
 
         if cached_user:
-            return Response({
-                'success': True,
-                'data': {
-                    'user': cached_user
-                }
-            }, status=status.HTTP_200_OK)
+            return success_response(
+                data={'user': cached_user},
+                status_code=status.HTTP_200_OK
+            )
 
         user_data = UserAccountSerializer(request.user).data
         CacheService.set(cache_key, user_data, timeout=300)
 
-        return Response({
-            'success': True,
-            'data': {
-                'user': user_data
-            }
-        }, status=status.HTTP_200_OK)
+        return success_response(
+            data={'user': user_data},
+            status_code=status.HTTP_200_OK
+        )
 
 class UpdateProfileView(APIView):
     """
@@ -249,16 +244,42 @@ class UpdateProfileView(APIView):
             cache_key = user_profile_key(request.user.id)
             CacheService.delete(cache_key)
             
-            return Response({
-                'success': True,
-                'message': 'Profile updated successfully',
-                'data': {
-                    'user': UserAccountSerializer(user).data
-                }
-            }, status=status.HTTP_200_OK)
+            return success_response(
+                data={'user': UserAccountSerializer(user).data},
+                message='Profile updated successfully',
+                status_code=status.HTTP_200_OK
+            )
         
-        return Response({
-            'success': False,
-            'message': 'Profile update failed',
-            'errors': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return error_response(
+            message='Profile update failed',
+            errors=serializer.errors,
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+class UserListView(APIView):
+    """
+    List of registered users so the current user can start a chat
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: OpenApiResponse(response=UserAccountSerializer(many=True))},
+        tags=['User Profile'],
+        summary='Get all available users to chat with',
+        description='Returns a list of all registered users except the current user.'
+    )
+    def get(self, request):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        
+        # Get all users except the current completely
+        users = User.objects.exclude(id=request.user.id).order_by('username')
+        
+        # Note: if the DB is large, you might want pagination here later.
+        user_data = UserAccountSerializer(users, many=True).data
+
+        return success_response(
+            data=user_data,
+            status_code=status.HTTP_200_OK
+        )
