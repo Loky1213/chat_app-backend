@@ -4,6 +4,9 @@ from channels.db import database_sync_to_async
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from rest_framework_simplejwt.tokens import AccessToken
+import logging
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -23,7 +26,7 @@ class JwtAuthMiddleware(BaseMiddleware):
         query_params = parse_qs(query_string)
         token = query_params.get("token", [None])[0]
 
-        print("🔍 TOKEN:", token)
+        logger.debug(f"Middleware parsing Token: {token[:10]}..." if token else "NO TOKEN FOUND in parsing")
 
         if token:
             try:
@@ -36,15 +39,15 @@ class JwtAuthMiddleware(BaseMiddleware):
                     user_id = int(user_id)  # ✅ CRITICAL FIX
 
                 user = await get_user(user_id)
-                print("✅ AUTH USER:", user)
+                logger.info(f"WebSocket Authenticated: User {user}")
 
                 scope["user"] = user
 
             except Exception as e:
-                print("❌ JWT ERROR:", str(e))
+                logger.error(f"WebSocket JWT ERROR: {str(e)}", exc_info=True)
                 scope["user"] = AnonymousUser()
         else:
-            print("❌ NO TOKEN")
+            logger.warning("NO TOKEN provided in WebSocket connection")
             scope["user"] = AnonymousUser()
 
         return await super().__call__(scope, receive, send)

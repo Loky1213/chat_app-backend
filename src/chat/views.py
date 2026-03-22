@@ -3,7 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 
-from django.db.models import Count
+from django.db.models import Count, Q
 from .models import Conversation, Message
 from .serializers import (
     ConversationListSerializer,
@@ -13,11 +13,15 @@ from .serializers import (
     CreateGroupSerializer,
     AddMembersSerializer,
     PromoteAdminSerializer,
+    RemoveAdminSerializer,
 )
 
 from .services import ChatService
 from utils.api_response import success_response, error_response
-from utils.pagination import StandardPagination
+from utils.pagination import StandardPagination, MessageCursorPagination
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ==============================
@@ -103,9 +107,14 @@ class ConversationListView(APIView):
     def get(self, request):
         conversations = Conversation.objects.filter(
             conversationparticipant__user=request.user
+        ).annotate(
+            unread_count_annotated=Count(
+                "messages",
+                filter=~Q(messages__messageread__user=request.user) & ~Q(messages__sender=request.user),
+                distinct=True
+            )
         ).select_related("last_message").prefetch_related(
-            "conversationparticipant_set__user",
-            "conversationparticipant_set__last_read_message"
+            "conversationparticipant_set__user"
         ).distinct()
 
         serializer = ConversationListSerializer(
@@ -183,14 +192,16 @@ class MessageListView(APIView):
 
         messages = Message.objects.filter(
             conversation_id=conversation_id
+        ).select_related("sender").prefetch_related(
+            "messageread_set"
         ).order_by("-created_at")
 
         # Remove "delete for me"
         messages = messages.exclude(
-            deleted_for_users__user=request.user
+            deleted_for_users=request.user
         )
 
-        paginator = StandardPagination()
+        paginator = MessageCursorPagination()
         page = paginator.paginate_queryset(messages, request, view=self)
 
         if page is not None:
@@ -319,4 +330,37 @@ class MarkAsReadView(APIView):
         return success_response(
             message="Marked as read",
             status_code=status.HTTP_200_OK
+        )
+
+
+# ==============================
+# 🔹 REMOVE ADMIN
+# ==============================
+class RemoveAdminView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=RemoveAdminSerializer,
+        tags=["Chat"],
+        summary="Remove user from admin"
+    )
+    def post(self, request, conversation_id):
+        serializer = RemoveAdminSerializer(data=request.data)
+
+        if serializer.is_valid():
+            ChatService.remove_admin(
+                request.user,
+                conversation_id,
+                serializer.validated_data["user_id"]
+            )
+
+            return success_response(
+                message="User removed from admin",
+                status_code=status.HTTP_200_OK
+            )
+
+        return error_response(
+            message="Validation failed",
+            errors=serializer.errors,
+            status_code=status.HTTP_400_BAD_REQUEST
         )

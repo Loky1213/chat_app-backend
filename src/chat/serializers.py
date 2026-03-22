@@ -1,11 +1,12 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 
 from .models import (
     Conversation,
     ConversationParticipant,
     Message,
-    MessageDeletion
+    MessageRead
 )
 
 from user.serializers import UserAccountSerializer  # 👈 reuse
@@ -20,6 +21,7 @@ class ChatUserSerializer(serializers.ModelSerializer):
 class MessageSerializer(serializers.ModelSerializer):
     sender = ChatUserSerializer(read_only=True)
     is_deleted = serializers.SerializerMethodField()
+    read_by = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -31,7 +33,13 @@ class MessageSerializer(serializers.ModelSerializer):
             "file",
             "created_at",
             "is_deleted",
+            "read_by",
         ]
+
+    def get_read_by(self, obj):
+        if hasattr(obj, 'messageread_set'):
+            return [mr.user_id for mr in getattr(obj, 'messageread_set').all()]
+        return []
 
     def get_is_deleted(self, obj):
         request = self.context.get("request")
@@ -42,10 +50,7 @@ class MessageSerializer(serializers.ModelSerializer):
 
         # Deleted for me
         if request and request.user:
-            return MessageDeletion.objects.filter(
-                message=obj,
-                user=request.user
-            ).exists()
+            return obj.deleted_for_users.filter(id=request.user.id).exists()
 
         return False
 
@@ -85,34 +90,17 @@ class ConversationListSerializer(serializers.ModelSerializer):
             {
                 "id": p.user.id,
                 "username": p.user.username,
-                "role": p.role
+                "role": p.role,
+                "is_online": bool(cache.get(f"online_user_{p.user.id}"))
             }
             for p in participants
         ]
 
 
     def get_unread_count(self, obj):
-        request = self.context.get("request")
-
-        if not request or not request.user:
-            return 0
-
-        # Iterate prefetched data instead of triggering a DB lookup
-        participant = next(
-            (p for p in obj.conversationparticipant_set.all() if p.user_id == request.user.id),
-            None
-        )
-        if not participant:
-            return 0
-
-        last_read = participant.last_read_message
-
-        if not last_read:
-            return obj.messages.count()
-
-        return obj.messages.filter(
-            created_at__gt=last_read.created_at
-        ).count()
+        if hasattr(obj, 'unread_count_annotated'):
+            return obj.unread_count_annotated
+        return 0
 
 
 class ConversationDetailSerializer(serializers.ModelSerializer):
@@ -138,7 +126,8 @@ class ConversationDetailSerializer(serializers.ModelSerializer):
                 "id": p.user.id,
                 "username": p.user.username,
                 "role": p.role,
-                "joined_at": p.joined_at
+                "joined_at": p.joined_at,
+                "is_online": bool(cache.get(f"online_user_{p.user.id}"))
             }
             for p in participants
         ]
@@ -162,4 +151,8 @@ class AddMembersSerializer(serializers.Serializer):
 
 
 class PromoteAdminSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField()
+
+
+class RemoveAdminSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()

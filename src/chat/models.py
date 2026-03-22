@@ -10,8 +10,8 @@ class Conversation(models.Model):
         ("group", "Group"),
     )
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-
+    # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    id = models.AutoField(primary_key=True)
     type = models.CharField(max_length=10, choices=TYPE_CHOICES)
 
     # Only used for group
@@ -49,6 +49,7 @@ class ConversationParticipant(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE)
 
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default="member")
+    is_creator = models.BooleanField(default=False)
 
     # 🔥 KEY FIELD → read receipts + unread count
     last_read_message = models.ForeignKey(
@@ -79,7 +80,8 @@ class Message(models.Model):
         ("file", "File"),
     )
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    id = models.AutoField(primary_key=True)
 
     conversation = models.ForeignKey(
         Conversation,
@@ -105,6 +107,7 @@ class Message(models.Model):
 
     # 🔥 Delete for everyone
     is_deleted_for_everyone = models.BooleanField(default=False)
+    deleted_for_users = models.ManyToManyField(User, blank=True, related_name="deleted_messages")
     deleted_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -112,25 +115,17 @@ class Message(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["conversation", "created_at"]),
+            models.Index(fields=["sender"]),
         ]
 
     def __str__(self):
         return f"{self.sender} -> {self.conversation}"
 
 
-class MessageDeletion(models.Model):
-    message = models.ForeignKey(
-        Message,
-        on_delete=models.CASCADE,
-        related_name="deleted_for_users"
-    )
-
-    user = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE
-    )
-
-    deleted_at = models.DateTimeField(auto_now_add=True)
+class MessageRead(models.Model):
+    message = models.ForeignKey(Message, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    seen_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = ("message", "user")
@@ -139,4 +134,4 @@ class MessageDeletion(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.user} deleted {self.message}"
+        return f"{self.user} read {self.message}"

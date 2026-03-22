@@ -3,8 +3,14 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from asgiref.sync import sync_to_async
+import logging
+
 from .models import ConversationParticipant
 from .services import ChatService
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -16,7 +22,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         # 🔐 Authentication check
         if not self.user or not self.user.is_authenticated:
-            print("❌ Unauthorized WebSocket connection")
+            logger.warning(f"Unauthorized WebSocket connection attempt denied.")
             await self.close()
             return
 
@@ -24,12 +30,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.conversation_id = self.scope["url_route"]["kwargs"].get("conversation_id")
         self.room_group_name = f"chat_{self.conversation_id}"
 
-        print(f"🔌 CONNECT: user={self.user}, room={self.room_group_name}")
+        logger.info(f"CONNECT: user={self.user}, room={self.room_group_name}")
 
         # 🔒 Authorization check
         is_member = await self.is_participant()
         if not is_member:
-            print(f"❌ User {self.user} not part of conversation {self.conversation_id}")
+            logger.warning(f"User {self.user} NOT authorized to join conversation {self.conversation_id}")
             await self.close()
             return
 
@@ -41,11 +47,37 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.accept()
 
+        # 📣 Broadcast online status
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "presence_update",
+                "status": "user_online",
+                "user_id": str(self.user.id)
+            }
+        )
+
+        # ⚡ Cache user online status
+        await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=86400)
+
 
     async def disconnect(self, close_code):
-        print(f"🔌 DISCONNECT: user={self.user}, code={close_code}")
+        logger.info(f"DISCONNECT: user={self.user}, code={close_code}")
 
         if hasattr(self, "room_group_name"):
+            # 📣 Broadcast offline status
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "presence_update",
+                    "status": "user_offline",
+                    "user_id": str(self.user.id)
+                }
+            )
+
+            # ⚡ Remove cache user online status
+            await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
+
             await self.channel_layer.group_discard(
                 self.room_group_name,
                 self.channel_name
@@ -53,7 +85,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
 
     async def receive(self, text_data):
-        print(f"📩 RAW DATA: {text_data}")
+        logger.debug(f"RAW DATA received from user {self.user}: {text_data}")
 
         # 🔒 Safe JSON parsing
         try:
@@ -90,16 +122,78 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
 
         # ==============================
+        # 🔹 DELETE MESSAGE
+        # ==============================
+        elif action == "delete_message":
+            message_id = data.get("message_id")
+            mode = data.get("mode", "everyone")
+
+            if not message_id:
+                await self.send(text_data=json.dumps({"error": "Message ID required"}))
+                return
+
+            try:
+                await self.delete_message_action(message_id, mode)
+                
+                # Broadcast for everyone, or send back to sender for "me"
+                if mode == "everyone":
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "message_deleted_event",
+                            "message_id": message_id,
+                            "mode": mode
+                        }
+                    )
+                else:
+                    await self.send(text_data=json.dumps({
+                        "type": "message_deleted",
+                        "message_id": message_id,
+                        "mode": mode
+                    }))
+            except Exception as e:
+                logger.exception(f"Exception during delete_message_action for user {self.user}: {str(e)}")
+                await self.send(text_data=json.dumps({"error": str(e)}))
+
+        # ==============================
         # 🔹 MARK AS READ
         # ==============================
         elif action == "mark_read":
-            await self.mark_as_read()
+            message_id = data.get("message_id")
 
+            try:
+                if message_id:
+                    await self.mark_message_seen_action(message_id)
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "message_seen_event",
+                            "message_id": message_id,
+                            "user_id": str(self.user.id)
+                        }
+                    )
+                else:
+                    # Legacy fallback
+                    await self.mark_as_read()
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "read_receipt",
+                            "user_id": str(self.user.id)
+                        }
+                    )
+            except Exception as e:
+                logger.error(f"Error marking as read for user {self.user}: {str(e)}", exc_info=True)
+
+        # ==============================
+        # 🔹 TYPING
+        # ==============================
+        elif action == "typing":
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
-                    "type": "read_receipt",
-                    "user_id": self.user.id
+                    "type": "user_typing_event",
+                    "user_id": str(self.user.id)
                 }
             )
 
@@ -118,7 +212,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "data": event["data"]
         }))
 
-
     # ==============================
     # 🔹 READ RECEIPT BROADCAST
     # ==============================
@@ -127,6 +220,33 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "type": "read_receipt",
             "user_id": event["user_id"]
         }))
+
+    async def presence_update(self, event):
+        await self.send(text_data=json.dumps({
+            "type": event["status"],
+            "user_id": event["user_id"]
+        }))
+
+    async def message_deleted_event(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "message_deleted",
+            "message_id": event["message_id"],
+            "mode": event["mode"]
+        }))
+
+    async def message_seen_event(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "message_seen",
+            "message_id": event["message_id"],
+            "user_id": event["user_id"]
+        }))
+
+    async def user_typing_event(self, event):
+        if event["user_id"] != str(self.user.id):
+            await self.send(text_data=json.dumps({
+                "type": "typing",
+                "user_id": event["user_id"]
+            }))
 
 
     # ==============================
@@ -167,6 +287,21 @@ class ChatConsumer(AsyncWebsocketConsumer):
         ChatService.mark_as_read(
             user=self.user,
             conversation_id=self.conversation_id
+        )
+
+    @database_sync_to_async
+    def delete_message_action(self, message_id, mode):
+        ChatService.delete_message(
+            request_user=self.user,
+            message_id=message_id,
+            mode=mode
+        )
+
+    @database_sync_to_async
+    def mark_message_seen_action(self, message_id):
+        ChatService.mark_message_seen(
+            user=self.user,
+            message_id=message_id
         )
 
 

@@ -9,6 +9,7 @@ from .views import (
     AddMembersView,
     RemoveMemberView,
     PromoteAdminView,
+    RemoveAdminView,
     MarkAsReadView,
 )
 
@@ -24,22 +25,23 @@ urlpatterns = [
     # 🔹 CONVERSATIONS
     # ==============================
     path("conversations/", ConversationListView.as_view(), name="conversation-list"),
-    path("conversations/<uuid:conversation_id>/", ConversationDetailView.as_view(), name="conversation-detail"),
+    path("conversations/<int:conversation_id>/", ConversationDetailView.as_view(), name="conversation-detail"),
 
     # ==============================
     # 🔹 MESSAGES
     # ==============================
-    path("conversations/<uuid:conversation_id>/messages/", MessageListView.as_view(), name="message-list"),
+    path("conversations/<int:conversation_id>/messages/", MessageListView.as_view(), name="message-list"),
 
     # ==============================
     # 🔹 GROUP MANAGEMENT
     # ==============================
-    path("conversations/<uuid:conversation_id>/add-members/", AddMembersView.as_view(), name="add-members"),
-    path("conversations/<uuid:conversation_id>/remove-member/<uuid:user_id>/", RemoveMemberView.as_view(), name="remove-member"),
-    path("conversations/<uuid:conversation_id>/promote-admin/", PromoteAdminView.as_view(), name="promote-admin"),
+    path("conversations/<int:conversation_id>/add-members/", AddMembersView.as_view(), name="add-members"),
+    path("conversations/<int:conversation_id>/remove-member/<int:user_id>/", RemoveMemberView.as_view(), name="remove-member"),
+    path("conversations/<int:conversation_id>/promote-admin/", PromoteAdminView.as_view(), name="promote-admin"),
+    path("conversations/<int:conversation_id>/remove-admin/", RemoveAdminView.as_view(), name="remove-admin"),
 
     # ==============================
     # 🔹 READ RECEIPTS
     # ==============================
-    path("conversations/<uuid:conversation_id>/mark-read/", MarkAsReadView.as_view(), name="mark-as-read"),
+    path("conversations/<int:conversation_id>/mark-read/", MarkAsReadView.as_view(), name="mark-as-read"),
 ]

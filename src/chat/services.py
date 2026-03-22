@@ -10,6 +10,9 @@ from .models import (
     ConversationParticipant,
     Message,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -55,6 +58,7 @@ class ChatService:
             ConversationParticipant(user=user2, conversation=conversation),
         ])
 
+        logger.info(f"Private chat created: {conversation.id} between users {user1.id} and {user2.id}")
         return conversation
 
 
@@ -78,7 +82,8 @@ class ChatService:
             ConversationParticipant(
                 user=creator,
                 conversation=conversation,
-                role="admin"
+                role="admin",
+                is_creator=True
             )
         )
 
@@ -95,6 +100,7 @@ class ChatService:
 
         ConversationParticipant.objects.bulk_create(participants)
 
+        logger.info(f"Group chat '{name}' created: {conversation.id} by user {creator.id}")
         return conversation
 
 
@@ -159,11 +165,18 @@ class ChatService:
         if admin.role != "admin":
             raise PermissionDenied("Only admin can remove members")
 
-        # Prevent removing self if last admin (optional logic)
-        ConversationParticipant.objects.filter(
-            conversation=conversation,
-            user_id=user_id
-        ).delete()
+        try:
+            target = ConversationParticipant.objects.get(
+                conversation=conversation,
+                user_id=user_id
+            )
+        except ConversationParticipant.DoesNotExist:
+            raise NotFound("User not in conversation")
+
+        if target.is_creator:
+            raise PermissionDenied("Cannot remove the group creator")
+
+        target.delete()
 
         return True
 
@@ -232,11 +245,12 @@ class ChatService:
         conversation.last_message = message
         conversation.save(update_fields=["last_message"])
 
+        logger.info(f"Message sent in {conversation_id} by {user.id}")
         return message
 
 
     # ==============================
-    # 🔹 MARK AS READ
+    # 🔹 MARK AS READ (CONVERSATION)
     # ==============================
     @staticmethod
     def mark_as_read(user, conversation_id):
@@ -258,5 +272,119 @@ class ChatService:
         except ConversationParticipant.DoesNotExist:
             raise PermissionDenied("Not part of this conversation")
 
+        # Bulks create MessageReads for legacy fallback
+        from .models import MessageRead
+        unread_messages = conversation.messages.exclude(
+            sender=user
+        ).exclude(
+            messageread__user=user
+        )
+
+        message_reads = [
+            MessageRead(message=msg, user=user) 
+            for msg in unread_messages
+        ]
+        if message_reads:
+            MessageRead.objects.bulk_create(message_reads, ignore_conflicts=True)
+
         participant.last_read_message = last_message
         participant.save(update_fields=["last_read_message"])
+
+
+    # ==============================
+    # 🔹 DELETE MESSAGE
+    # ==============================
+    @staticmethod
+    def delete_message(request_user, message_id, mode):
+        try:
+            message = Message.objects.get(id=message_id)
+        except Message.DoesNotExist:
+            raise NotFound("Message not found")
+
+        # Check membership
+        if not ConversationParticipant.objects.filter(
+            user=request_user,
+            conversation=message.conversation
+        ).exists():
+            raise PermissionDenied("Not part of this conversation")
+
+        if mode == "everyone":
+            if message.sender != request_user:
+                raise PermissionDenied("Only sender can delete for everyone")
+            message.is_deleted_for_everyone = True
+            message.deleted_at = timezone.now()
+            message.save(update_fields=["is_deleted_for_everyone", "deleted_at"])
+        elif mode == "me":
+            message.deleted_for_users.add(request_user)
+        else:
+            raise ValueError("Invalid mode")
+
+        return message
+
+    # ==============================
+    # 🔹 REMOVE ADMIN
+    # ==============================
+    @staticmethod
+    def remove_admin(request_user, conversation_id, user_id):
+        try:
+            conversation = Conversation.objects.get(id=conversation_id)
+        except Conversation.DoesNotExist:
+            raise NotFound("Conversation not found")
+
+        try:
+            admin = ConversationParticipant.objects.get(
+                user=request_user,
+                conversation=conversation
+            )
+        except ConversationParticipant.DoesNotExist:
+            raise PermissionDenied("You are not part of this conversation")
+
+        if admin.role != "admin":
+            raise PermissionDenied("Only admin can demote members")
+
+        try:
+            target = ConversationParticipant.objects.get(
+                conversation=conversation,
+                user_id=user_id
+            )
+        except ConversationParticipant.DoesNotExist:
+            raise NotFound("User not in conversation")
+
+        if target.is_creator:
+            raise PermissionDenied("Cannot demote the group creator")
+
+        if target.role == "admin":
+            target.role = "member"
+            target.save(update_fields=["role"])
+
+        return True
+
+    # ==============================
+    # 🔹 MARK MESSAGE AS SEEN
+    # ==============================
+    @staticmethod
+    def mark_message_seen(user, message_id):
+        try:
+            message = Message.objects.get(id=message_id)
+        except Message.DoesNotExist:
+            raise NotFound("Message not found")
+
+        try:
+            participant = ConversationParticipant.objects.get(
+                user=user,
+                conversation=message.conversation
+            )
+        except ConversationParticipant.DoesNotExist:
+            raise PermissionDenied("Not part of this conversation")
+
+        # Create MessageRead
+        from .models import MessageRead
+        MessageRead.objects.get_or_create(
+            message=message,
+            user=user
+        )
+
+        participant.last_read_message = message
+        participant.save(update_fields=["last_read_message"])
+
+        return True
