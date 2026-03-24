@@ -3,7 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 
-from django.db.models import Count, Q
+from django.db.models import Count, Q, F
 from .models import Conversation, Message
 from .serializers import (
     ConversationListSerializer,
@@ -115,7 +115,7 @@ class ConversationListView(APIView):
             )
         ).select_related("last_message").prefetch_related(
             "conversationparticipant_set__user"
-        ).distinct()
+        ).order_by(F("last_message__created_at").desc(nulls_last=True), "-created_at").distinct()
 
         serializer = ConversationListSerializer(
             conversations,

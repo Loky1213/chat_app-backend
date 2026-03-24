@@ -220,9 +220,10 @@ class ChatService:
     # 🔹 SEND MESSAGE
     # ==============================
     @staticmethod
+    @transaction.atomic
     def send_message(user, conversation_id, content=None, message_type="text", file=None):
         try:
-            conversation = Conversation.objects.get(id=conversation_id)
+            conversation = Conversation.objects.select_for_update().get(id=conversation_id)
         except Conversation.DoesNotExist:
             raise NotFound("Conversation not found")
 

@@ -65,7 +65,7 @@ class MessageSerializer(serializers.ModelSerializer):
 
 
 class ConversationListSerializer(serializers.ModelSerializer):
-    last_message = MessageSerializer(read_only=True)
+    last_message = serializers.SerializerMethodField()
     participants = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
 
@@ -95,6 +95,14 @@ class ConversationListSerializer(serializers.ModelSerializer):
             }
             for p in participants
         ]
+
+    def get_last_message(self, obj):
+        if obj.last_message:
+            return {
+                "content": obj.last_message.content,
+                "created_at": obj.last_message.created_at
+            }
+        return None
 
 
     def get_unread_count(self, obj):

@@ -7,7 +7,7 @@ from django.core.cache import cache
 from asgiref.sync import sync_to_async
 import logging
 
-from .models import ConversationParticipant
+from .models import ConversationParticipant, Message
 from .services import ChatService
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 }))
                 return
 
+            # Ensure sender unread count is always 0
+            await self.reset_unread_count(self.user.id)
+
             saved_message = await self.save_message(message, message_type)
 
             await self.channel_layer.group_send(
@@ -120,6 +123,27 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "data": saved_message
                 }
             )
+
+            # Get participants to broadcast notifications globally
+            participant_ids = await self.get_conversation_participants()
+            
+            # Broadcast to each participant's personal group
+            for p_id in participant_ids:
+                unread_count = 0
+                if p_id != self.user.id:
+                    unread_count = await self.increment_unread_count(p_id)
+                else:
+                    unread_count = await self.get_unread_count(p_id)
+
+                await self.channel_layer.group_send(
+                    f"user_{p_id}",
+                    {
+                        "type": "new_message",
+                        "conversation_id": self.conversation_id,
+                        "last_message": saved_message,
+                        "unread_count": unread_count
+                    }
+                )
 
         # ==============================
         # 🔹 DELETE MESSAGE
@@ -162,6 +186,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message_id = data.get("message_id")
 
             try:
+                # Reset Redis unread count (O(1) performance)
+                await self.reset_unread_count(self.user.id)
+
                 if message_id:
                     await self.mark_message_seen_action(message_id)
                     await self.channel_layer.group_send(
@@ -303,6 +330,105 @@ class ChatConsumer(AsyncWebsocketConsumer):
             user=self.user,
             message_id=message_id
         )
+
+    @database_sync_to_async
+    def get_conversation_participants(self):
+        return list(ConversationParticipant.objects.filter(
+            conversation_id=self.conversation_id
+        ).values_list("user_id", flat=True))
+
+    @database_sync_to_async
+    def get_unread_count_fallback(self, user_id):
+        try:
+            participant = ConversationParticipant.objects.get(
+                user_id=user_id,
+                conversation_id=self.conversation_id
+            )
+            if participant.last_read_message_id:
+                return Message.objects.filter(
+                    conversation_id=self.conversation_id,
+                    id__gt=participant.last_read_message_id
+                ).exclude(sender_id=user_id).count()
+            else:
+                return Message.objects.filter(
+                    conversation_id=self.conversation_id
+                ).exclude(sender_id=user_id).count()
+        except ConversationParticipant.DoesNotExist:
+            return 0
+
+    async def get_unread_count(self, user_id):
+        redis_key = f"chat:unread:{user_id}:{self.conversation_id}"
+        count = await sync_to_async(cache.get)(redis_key)
+        if count is None:
+            count = await self.get_unread_count_fallback(user_id)
+            await sync_to_async(cache.add)(redis_key, count, timeout=604800)
+        return count
+
+    async def increment_unread_count(self, user_id):
+        redis_key = f"chat:unread:{user_id}:{self.conversation_id}"
+        
+        # Only call cache.incr() if key already exists
+        count = await sync_to_async(cache.get)(redis_key)
+        if count is not None:
+            return await sync_to_async(cache.incr)(redis_key)
+            
+        # Initialize by computing from DB and adding safely
+        count = await self.get_unread_count_fallback(user_id)
+        added = await sync_to_async(cache.add)(redis_key, count, timeout=604800)
+        if not added:
+            count = await sync_to_async(cache.incr)(redis_key)
+        return count
+
+    async def reset_unread_count(self, user_id):
+        redis_key = f"chat:unread:{user_id}:{self.conversation_id}"
+        
+        # Prevent accidental overwrite when cache.get() returns None
+        count = await sync_to_async(cache.get)(redis_key)
+        if count is not None:
+            if count != 0:
+                await sync_to_async(cache.set)(redis_key, 0, timeout=604800)
+        else:
+            await sync_to_async(cache.add)(redis_key, 0, timeout=604800)
+
+
+class NotificationConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.user = self.scope["user"]
+
+        if not self.user or not self.user.is_authenticated:
+            logger.warning("Unauthorized Notification WebSocket connection attempt denied.")
+            await self.close()
+            return
+
+        self.user_group_name = f"user_{self.user.id}"
+
+        # Join personal user group for notifications
+        await self.channel_layer.group_add(
+            self.user_group_name,
+            self.channel_name
+        )
+
+        await self.accept()
+        logger.info(f"Notification CONNECT: user={self.user}, group={self.user_group_name}")
+
+    async def disconnect(self, close_code):
+        logger.info(f"Notification DISCONNECT: user={self.user}, code={close_code}")
+        if hasattr(self, "user_group_name"):
+            await self.channel_layer.group_discard(
+                self.user_group_name,
+                self.channel_name
+            )
+
+    async def new_message(self, event):
+        payload = {
+            "type": "new_message",
+            "conversation_id": event["conversation_id"],
+            "last_message": event.get("last_message")
+        }
+        if "unread_count" in event:
+            payload["unread_count"] = event["unread_count"]
+
+        await self.send(text_data=json.dumps(payload))
 
 
 
