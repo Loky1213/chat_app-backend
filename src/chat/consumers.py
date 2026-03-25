@@ -409,16 +409,88 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             self.channel_name
         )
 
+        # Join global presence group
+        await self.channel_layer.group_add(
+            "global_presence",
+            self.channel_name
+        )
+
         await self.accept()
         logger.info(f"Notification CONNECT: user={self.user}, group={self.user_group_name}")
 
+        conn_count = await self.increment_connection()
+        
+        if conn_count == 1:
+            await self.channel_layer.group_send(
+                "global_presence",
+                {
+                    "type": "presence_update",
+                    "user_id": str(self.user.id),
+                    "status": "user_online"
+                }
+            )
+
+    @database_sync_to_async
+    def increment_connection(self):
+        redis_key = f"global_connections:{self.user.id}"
+        try:
+            return cache.incr(redis_key)
+        except ValueError:
+            cache.set(redis_key, 1, timeout=86400)
+            return 1
+
+    @database_sync_to_async
+    def decrement_connection(self):
+        redis_key = f"global_connections:{self.user.id}"
+        try:
+            count = cache.decr(redis_key)
+            if count < 0:
+                cache.set(redis_key, 0, timeout=86400)
+                return 0
+            return count
+        except ValueError:
+            cache.set(redis_key, 0, timeout=86400)
+            return 0
+
     async def disconnect(self, close_code):
         logger.info(f"Notification DISCONNECT: user={self.user}, code={close_code}")
+        
         if hasattr(self, "user_group_name"):
+            conn_count = await self.decrement_connection()
+
+            # Delay to avoid flicker on immediate reload
+            await asyncio.sleep(1.5)
+
+            redis_key = f"global_connections:{self.user.id}"
+            current_count = await sync_to_async(cache.get)(redis_key)
+
+            if current_count is not None:
+                if int(current_count) <= 0:
+                    await self.channel_layer.group_send(
+                        "global_presence",
+                        {
+                            "type": "presence_update",
+                            "user_id": str(self.user.id),
+                            "status": "user_offline"
+                        }
+                    )
+
             await self.channel_layer.group_discard(
                 self.user_group_name,
                 self.channel_name
             )
+
+            await self.channel_layer.group_discard(
+                "global_presence",
+                self.channel_name
+            )
+
+    async def presence_update(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "presence_update",
+            "user_id": event["user_id"],
+            "status": event["status"]
+        }))
 
     async def new_message(self, event):
         payload = {
