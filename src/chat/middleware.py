@@ -93,3 +93,7 @@ class JwtAuthMiddleware(BaseMiddleware):
 
 #         # 3. Pass control to the next application (your consumer)
 #         return await super().__call__(scope, receive, send)
+#             scope["user"] = AnonymousUser()
+
+#         # 3. Pass control to the next application (your consumer)
+#         return await super().__call__(scope, receive, send)

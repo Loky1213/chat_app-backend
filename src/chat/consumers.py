@@ -1,4 +1,5 @@
 import json
+import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 
@@ -47,36 +48,65 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.accept()
 
-        # 📣 Broadcast online status
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                "type": "presence_update",
-                "status": "user_online",
-                "user_id": str(self.user.id)
-            }
-        )
+        # 📣 Broadcast online status if first connection
+        conn_count = await self.increment_connection()
+        
+        if conn_count == 1:
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "presence_update",
+                    "status": "user_online",
+                    "user_id": str(self.user.id)
+                }
+            )
 
-        # ⚡ Cache user online status
-        await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=86400)
+    @database_sync_to_async
+    def increment_connection(self):
+        redis_key = f"user_connections:{self.user.id}"
+        try:
+            return cache.incr(redis_key)
+        except ValueError:
+            cache.set(redis_key, 1, timeout=86400)
+            return 1
+
+    @database_sync_to_async
+    def decrement_connection(self):
+        redis_key = f"user_connections:{self.user.id}"
+        try:
+            count = cache.decr(redis_key)
+            if count < 0:
+                cache.set(redis_key, 0, timeout=86400)
+                return 0
+            return count
+        except ValueError:
+            cache.set(redis_key, 0, timeout=86400)
+            return 0
 
 
     async def disconnect(self, close_code):
         logger.info(f"DISCONNECT: user={self.user}, code={close_code}")
 
         if hasattr(self, "room_group_name"):
-            # 📣 Broadcast offline status
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "presence_update",
-                    "status": "user_offline",
-                    "user_id": str(self.user.id)
-                }
-            )
+            conn_count = await self.decrement_connection()
 
-            # ⚡ Remove cache user online status
-            await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
+            # Delay to avoid flicker on immediate reload
+            await asyncio.sleep(1.5)
+
+            redis_key = f"user_connections:{self.user.id}"
+            current_count = await sync_to_async(cache.get)(redis_key)
+
+            if current_count is not None:
+                if int(current_count) <= 0:
+                    # 📣 Broadcast offline status
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "presence_update",
+                            "status": "user_offline",
+                            "user_id": str(self.user.id)
+                        }
+                    )
 
             await self.channel_layer.group_discard(
                 self.room_group_name,
@@ -114,36 +144,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             # Ensure sender unread count is always 0
             await self.reset_unread_count(self.user.id)
 
-            saved_message = await self.save_message(message, message_type)
-
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "chat_message",
-                    "data": saved_message
-                }
-            )
-
-            # Get participants to broadcast notifications globally
-            participant_ids = await self.get_conversation_participants()
-            
-            # Broadcast to each participant's personal group
-            for p_id in participant_ids:
-                unread_count = 0
-                if p_id != self.user.id:
-                    unread_count = await self.increment_unread_count(p_id)
-                else:
-                    unread_count = await self.get_unread_count(p_id)
-
-                await self.channel_layer.group_send(
-                    f"user_{p_id}",
-                    {
-                        "type": "new_message",
-                        "conversation_id": self.conversation_id,
-                        "last_message": saved_message,
-                        "unread_count": unread_count
-                    }
-                )
+            await self.save_message(message, message_type)
 
         # ==============================
         # 🔹 DELETE MESSAGE
@@ -565,6 +566,74 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 #                 "username": self.user.username
 #             },
 #             "created_at": str(message.created_at)
+#         }
+
+
+#     @database_sync_to_async
+#     def mark_as_read(self):
+#         ChatService.mark_as_read(
+#             user=self.user,
+#             conversation_id=self.conversation_id
+#         )
+
+
+
+
+
+
+
+# import json
+# from channels.generic.websocket import AsyncWebsocketConsumer
+
+
+# class ChatConsumer(AsyncWebsocketConsumer):
+
+#     async def connect(self):
+#         # 👇 Ignore authentication for now
+#         self.user = self.scope.get("user", None)
+#         print("🔥 CONNECT HIT | USER:", self.user)
+
+#         # 👇 Get conversation id safely
+#         self.conversation_id = self.scope["url_route"]["kwargs"].get("conversation_id", "test")
+#         self.room_group_name = f"chat_{self.conversation_id}"
+
+#         print("📡 ROOM:", self.room_group_name)
+
+#         # 👇 Accept connection immediately
+#         await self.accept()
+
+#         # 👇 Join group (no Redis needed yet, but safe)
+#         try:
+#             await self.channel_layer.group_add(
+#                 self.room_group_name,
+#                 self.channel_name
+#             )
+#         except Exception as e:
+#             print("⚠️ Group add failed (ignore for now):", e)
+
+
+#     async def disconnect(self, close_code):
+#         print("🔌 DISCONNECTED")
+
+#         try:
+#             await self.channel_layer.group_discard(
+#                 self.room_group_name,
+#                 self.channel_name
+#             )
+#         except Exception:
+#             pass
+
+
+#     async def receive(self, text_data):
+#         print("📩 RECEIVED:", text_data)
+
+#         data = json.loads(text_data)
+
+#         # 👇 Echo back (simple test)
+#         await self.send(text_data=json.dumps({
+#             "message": data.get("message", "No message received"),
+#             "status": "ok"
+#         })) "created_at": str(message.created_at)
 #         }
 
 
