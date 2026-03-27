@@ -10,6 +10,7 @@ import logging
 
 from .models import ConversationParticipant, Message
 from .services import ChatService
+from .utils.logger import log_chat_event
 
 logger = logging.getLogger(__name__)
 
@@ -48,65 +49,29 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.accept()
 
-        # 📣 Broadcast online status if first connection
-        conn_count = await self.increment_connection()
-        
-        if conn_count == 1:
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "presence_update",
-                    "status": "user_online",
-                    "user_id": str(self.user.id)
-                }
+        try:
+            log_chat_event(
+                action="WS_EVENT",
+                user_id=self.user.id,
+                conversation_id=int(self.conversation_id),
+                extra={"event": "connect"}
             )
-
-    @database_sync_to_async
-    def increment_connection(self):
-        redis_key = f"user_connections:{self.user.id}"
-        try:
-            return cache.incr(redis_key)
-        except ValueError:
-            cache.set(redis_key, 1, timeout=86400)
-            return 1
-
-    @database_sync_to_async
-    def decrement_connection(self):
-        redis_key = f"user_connections:{self.user.id}"
-        try:
-            count = cache.decr(redis_key)
-            if count < 0:
-                cache.set(redis_key, 0, timeout=86400)
-                return 0
-            return count
-        except ValueError:
-            cache.set(redis_key, 0, timeout=86400)
-            return 0
-
+        except Exception:
+            pass
 
     async def disconnect(self, close_code):
         logger.info(f"DISCONNECT: user={self.user}, code={close_code}")
 
         if hasattr(self, "room_group_name"):
-            conn_count = await self.decrement_connection()
-
-            # Delay to avoid flicker on immediate reload
-            await asyncio.sleep(1.5)
-
-            redis_key = f"user_connections:{self.user.id}"
-            current_count = await sync_to_async(cache.get)(redis_key)
-
-            if current_count is not None:
-                if int(current_count) <= 0:
-                    # 📣 Broadcast offline status
-                    await self.channel_layer.group_send(
-                        self.room_group_name,
-                        {
-                            "type": "presence_update",
-                            "status": "user_offline",
-                            "user_id": str(self.user.id)
-                        }
-                    )
+            try:
+                log_chat_event(
+                    action="WS_EVENT",
+                    user_id=self.user.id,
+                    conversation_id=int(self.conversation_id),
+                    extra={"event": "disconnect", "code": close_code}
+                )
+            except Exception:
+                pass
 
             await self.channel_layer.group_discard(
                 self.room_group_name,
@@ -134,6 +99,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         if action == "send_message":
             message = data.get("message")
             message_type = data.get("type", "text")
+            reply_to_id = data.get("reply_to")
 
             if not message:
                 await self.send(text_data=json.dumps({
@@ -144,7 +110,45 @@ class ChatConsumer(AsyncWebsocketConsumer):
             # Ensure sender unread count is always 0
             await self.reset_unread_count(self.user.id)
 
-            await self.save_message(message, message_type)
+            saved_message = await self.save_message(message, message_type, reply_to_id=reply_to_id)
+
+            # Issue 2: Duplicate WS event protection
+            redis_key = f"ws_sent:{saved_message['id']}:{self.conversation_id}"
+            is_sent = await sync_to_async(cache.get)(redis_key)
+            
+            if not is_sent:
+                await sync_to_async(cache.set)(redis_key, True, timeout=5)
+
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        "type": "chat_message",
+                        "data": saved_message
+                    }
+                )
+
+                # 🔹 BROADCAST NOTIFICATION TO ALL PARTICIPANTS
+                participants = await self.get_conversation_participants()
+                for p_id in participants:
+                    if str(p_id) != str(self.user.id):
+                        # Issue 4: Ensure other participants' unread counts are incremented
+                        unread_count = await self.increment_unread_count(str(p_id))
+                        
+                        # Issue 3: Weak Notification Payload + Issue 5
+                        await self.channel_layer.group_send(
+                            f"user_{p_id}",
+                            {
+                                "type": "new_message",
+                                "conversation_id": self.conversation_id,
+                                "last_message": {
+                                    "content": saved_message["content"],
+                                    "created_at": saved_message["created_at"],
+                                    "sender_id": str(saved_message["sender"]["id"]),
+                                    "is_forwarded": saved_message.get("is_forwarded", False)
+                                },
+                                "unread_count": unread_count
+                            }
+                        )
 
         # ==============================
         # 🔹 DELETE MESSAGE
@@ -178,6 +182,44 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     }))
             except Exception as e:
                 logger.exception(f"Exception during delete_message_action for user {self.user}: {str(e)}")
+                await self.send(text_data=json.dumps({"error": str(e)}))
+
+        # ==============================
+        # 🔹 REACTION TRIGGER
+        # ==============================
+        elif action == "react":
+            message_id = data.get("message_id")
+            emoji = data.get("emoji")
+
+            if not message_id or not emoji or not isinstance(emoji, str):
+                await self.send(text_data=json.dumps({"error": "Invalid reaction payload"}))
+                return
+
+            emoji = emoji.strip()
+            if not emoji or len(emoji) > 10:
+                await self.send(text_data=json.dumps({"error": "Invalid reaction payload"}))
+                return
+
+            # Dedup: prevent rapid duplicate broadcasts
+            dedup_key = f"reaction_ws:{message_id}:{emoji}:{self.user.id}"
+            is_dup = await sync_to_async(cache.get)(dedup_key)
+            if is_dup:
+                return
+
+            try:
+                reactions = await sync_to_async(ChatService.toggle_reaction)(self.user, message_id, emoji)
+
+                await sync_to_async(cache.set)(dedup_key, True, timeout=3)
+
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        "type": "reaction_update_event",
+                        "message_id": message_id,
+                        "reactions": reactions
+                    }
+                )
+            except Exception as e:
                 await self.send(text_data=json.dumps({"error": str(e)}))
 
         # ==============================
@@ -240,18 +282,19 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "data": event["data"]
         }))
 
+    async def reaction_update_event(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "reaction_update",
+            "message_id": event["message_id"],
+            "reactions": event["reactions"]
+        }))
+
     # ==============================
     # 🔹 READ RECEIPT BROADCAST
     # ==============================
     async def read_receipt(self, event):
         await self.send(text_data=json.dumps({
             "type": "read_receipt",
-            "user_id": event["user_id"]
-        }))
-
-    async def presence_update(self, event):
-        await self.send(text_data=json.dumps({
-            "type": event["status"],
             "user_id": event["user_id"]
         }))
 
@@ -290,24 +333,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
 
     @database_sync_to_async
-    def save_message(self, content, message_type):
+    def save_message(self, content, message_type, reply_to_id=None):
         message = ChatService.send_message(
             user=self.user,
             conversation_id=self.conversation_id,
             content=content,
-            message_type=message_type
+            message_type=message_type,
+            reply_to_id=reply_to_id
         )
 
-        return {
-            "id": str(message.id),
-            "content": message.content,
-            "message_type": message.message_type,
-            "sender": {
-                "id": str(self.user.id),
-                "username": self.user.username
-            },
-            "created_at": str(message.created_at)
-        }
+        from .serializers import MessageSerializer
+        return MessageSerializer(message, context={"request": None}).data
 
 
     @database_sync_to_async
@@ -338,58 +374,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             conversation_id=self.conversation_id
         ).values_list("user_id", flat=True))
 
-    @database_sync_to_async
-    def get_unread_count_fallback(self, user_id):
-        try:
-            participant = ConversationParticipant.objects.get(
-                user_id=user_id,
-                conversation_id=self.conversation_id
-            )
-            if participant.last_read_message_id:
-                return Message.objects.filter(
-                    conversation_id=self.conversation_id,
-                    id__gt=participant.last_read_message_id
-                ).exclude(sender_id=user_id).count()
-            else:
-                return Message.objects.filter(
-                    conversation_id=self.conversation_id
-                ).exclude(sender_id=user_id).count()
-        except ConversationParticipant.DoesNotExist:
-            return 0
-
     async def get_unread_count(self, user_id):
-        redis_key = f"chat:unread:{user_id}:{self.conversation_id}"
-        count = await sync_to_async(cache.get)(redis_key)
-        if count is None:
-            count = await self.get_unread_count_fallback(user_id)
-            await sync_to_async(cache.add)(redis_key, count, timeout=604800)
-        return count
+        return await sync_to_async(ChatService.get_unread_count)(user_id, self.conversation_id)
 
     async def increment_unread_count(self, user_id):
-        redis_key = f"chat:unread:{user_id}:{self.conversation_id}"
-        
-        # Only call cache.incr() if key already exists
-        count = await sync_to_async(cache.get)(redis_key)
-        if count is not None:
-            return await sync_to_async(cache.incr)(redis_key)
-            
-        # Initialize by computing from DB and adding safely
-        count = await self.get_unread_count_fallback(user_id)
-        added = await sync_to_async(cache.add)(redis_key, count, timeout=604800)
-        if not added:
-            count = await sync_to_async(cache.incr)(redis_key)
-        return count
+        return await sync_to_async(ChatService.increment_unread_count)(user_id, self.conversation_id)
 
     async def reset_unread_count(self, user_id):
-        redis_key = f"chat:unread:{user_id}:{self.conversation_id}"
-        
-        # Prevent accidental overwrite when cache.get() returns None
-        count = await sync_to_async(cache.get)(redis_key)
-        if count is not None:
-            if count != 0:
-                await sync_to_async(cache.set)(redis_key, 0, timeout=604800)
-        else:
-            await sync_to_async(cache.add)(redis_key, 0, timeout=604800)
+        return await sync_to_async(ChatService.reset_unread_count)(user_id, self.conversation_id)
 
 
 class NotificationConsumer(AsyncWebsocketConsumer):
@@ -418,6 +410,15 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         await self.accept()
         logger.info(f"Notification CONNECT: user={self.user}, group={self.user_group_name}")
 
+        try:
+            log_chat_event(
+                action="WS_EVENT",
+                user_id=self.user.id,
+                extra={"event": "notification_connect"}
+            )
+        except Exception:
+            pass
+
         conn_count = await self.increment_connection()
         
         if conn_count == 1:
@@ -433,6 +434,8 @@ class NotificationConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def increment_connection(self):
         redis_key = f"global_connections:{self.user.id}"
+        cache.set(f"online_user_{self.user.id}", True, timeout=60)
+        
         try:
             return cache.incr(redis_key)
         except ValueError:
@@ -454,6 +457,15 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         logger.info(f"Notification DISCONNECT: user={self.user}, code={close_code}")
+
+        try:
+            log_chat_event(
+                action="WS_EVENT",
+                user_id=self.user.id,
+                extra={"event": "notification_disconnect", "code": close_code}
+            )
+        except Exception:
+            pass
         
         if hasattr(self, "user_group_name"):
             conn_count = await self.decrement_connection()
@@ -466,6 +478,8 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
             if current_count is not None:
                 if int(current_count) <= 0:
+                    await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
+                    
                     await self.channel_layer.group_send(
                         "global_presence",
                         {
@@ -485,6 +499,16 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                 self.channel_name
             )
 
+    async def receive(self, text_data):
+        try:
+            data = json.loads(text_data)
+        except json.JSONDecodeError:
+            return
+
+        if data.get("action") == "ping":
+            await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=60)
+            await self.send(text_data=json.dumps({"type": "pong"}))
+
     async def presence_update(self, event):
         await self.send(text_data=json.dumps({
             "type": "presence_update",
@@ -502,6 +526,12 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             payload["unread_count"] = event["unread_count"]
 
         await self.send(text_data=json.dumps(payload))
+
+    async def unread_reset(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "unread_reset",
+            "conversation_id": event["conversation_id"]
+        }))
 
 
 

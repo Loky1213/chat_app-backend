@@ -11,6 +11,7 @@ from .views import (
     PromoteAdminView,
     RemoveAdminView,
     MarkAsReadView,
+    ForwardMessageView,
 )
 
 urlpatterns = [
@@ -44,4 +45,9 @@ urlpatterns = [
     # 🔹 READ RECEIPTS
     # ==============================
     path("conversations/<int:conversation_id>/mark-read/", MarkAsReadView.as_view(), name="mark-as-read"),
+
+    # ==============================
+    # 🔹 FORWARD MESSAGES
+    # ==============================
+    path("messages/forward/", ForwardMessageView.as_view(), name="forward-messages"),
 ]

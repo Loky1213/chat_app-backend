@@ -18,7 +18,7 @@ class Conversation(models.Model):
     name = models.CharField(max_length=255, null=True, blank=True)
     image = models.ImageField(upload_to="group_images/", null=True, blank=True)
 
-    # 🔥 Optimization: instant last message access
+    # Optimization: instant last message access
     last_message = models.ForeignKey(
         "Message",
         null=True,
@@ -51,7 +51,7 @@ class ConversationParticipant(models.Model):
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default="member")
     is_creator = models.BooleanField(default=False)
 
-    # 🔥 KEY FIELD → read receipts + unread count
+    #  KEY FIELD → read receipts + unread count
     last_read_message = models.ForeignKey(
         "Message",
         null=True,
@@ -104,8 +104,21 @@ class Message(models.Model):
     )
 
     file = models.FileField(upload_to="chat_files/", null=True, blank=True)
+    
+    #  Forwarding
+    is_forwarded = models.BooleanField(default=False)
+    original_message_id = models.IntegerField(null=True, blank=True)
 
-    # 🔥 Delete for everyone
+    #  Reply
+    reply_to = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="replies"
+    )
+
+    #  Delete for everyone
     is_deleted_for_everyone = models.BooleanField(default=False)
     deleted_for_users = models.ManyToManyField(User, blank=True, related_name="deleted_messages")
     deleted_at = models.DateTimeField(null=True, blank=True)
@@ -134,4 +147,24 @@ class MessageRead(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.user} read {self.message}"
+        return f"Read by {self.user} at {self.seen_at}"
+
+
+class MessageReaction(models.Model):
+    message = models.ForeignKey(
+        Message,
+        on_delete=models.CASCADE,
+        related_name="reactions"
+    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    emoji = models.CharField(max_length=10)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("message", "user")
+        indexes = [
+            models.Index(fields=["message", "emoji"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} reacted {self.emoji} on {self.message_id}"

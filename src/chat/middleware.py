@@ -33,7 +33,7 @@ class JwtAuthMiddleware(BaseMiddleware):
                 access_token = AccessToken(token)
 
                 user_id = access_token.get("user_id")
-                print("👤 RAW USER ID:", user_id)
+                print(" RAW USER ID:", user_id)
 
                 if user_id is not None:
                     user_id = int(user_id)  # ✅ CRITICAL FIX

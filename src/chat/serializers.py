@@ -1,6 +1,9 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.db.models import Count
+from django.core.cache import cache
+from .services import ChatService
 
 from .models import (
     Conversation,
@@ -9,7 +12,7 @@ from .models import (
     MessageRead
 )
 
-from user.serializers import UserAccountSerializer  # 👈 reuse
+from user.serializers import UserAccountSerializer  
 
 User = get_user_model()
 
@@ -22,6 +25,8 @@ class MessageSerializer(serializers.ModelSerializer):
     sender = ChatUserSerializer(read_only=True)
     is_deleted = serializers.SerializerMethodField()
     read_by = serializers.SerializerMethodField()
+    reply_to = serializers.SerializerMethodField()
+    reactions = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -32,8 +37,12 @@ class MessageSerializer(serializers.ModelSerializer):
             "message_type",
             "file",
             "created_at",
+            "created_at",
             "is_deleted",
             "read_by",
+            "is_forwarded",
+            "reply_to",
+            "reactions",
         ]
 
     def get_read_by(self, obj):
@@ -53,6 +62,53 @@ class MessageSerializer(serializers.ModelSerializer):
             return obj.deleted_for_users.filter(id=request.user.id).exists()
 
         return False
+
+    def get_reactions(self, obj):
+        request = self.context.get("request")
+        user_id = request.user.id if request and hasattr(request, "user") and request.user else None
+
+        # Fast path: use prefetched cache (no extra DB hits)
+        if hasattr(obj, "_prefetched_objects_cache") and "reactions" in obj._prefetched_objects_cache:
+            reactions_list = list(obj.reactions.all())
+            emoji_counts = {}
+            user_emojis = set()
+            for r in reactions_list:
+                emoji_counts[r.emoji] = emoji_counts.get(r.emoji, 0) + 1
+                if r.user_id == user_id:
+                    user_emojis.add(r.emoji)
+
+            return [
+                {
+                    "emoji": emoji,
+                    "count": count,
+                    "user_reacted": emoji in user_emojis
+                }
+                for emoji, count in emoji_counts.items()
+            ]
+
+        # Fallback: DB aggregation
+       
+        reactions_qs = list(obj.reactions.values("emoji").annotate(count=Count("id")))
+        if user_id:
+            user_emojis = set(
+                obj.reactions.filter(user_id=user_id).values_list("emoji", flat=True)
+            )
+        else:
+            user_emojis = set()
+
+        for r in reactions_qs:
+            r["user_reacted"] = r["emoji"] in user_emojis
+        return reactions_qs
+
+    def get_reply_to(self, obj):
+        if obj.reply_to:
+            return {
+                "id": obj.reply_to.id,
+                "content": "Message deleted" if obj.reply_to.is_deleted_for_everyone else obj.reply_to.content,
+                "sender_id": str(obj.reply_to.sender_id),
+                "sender_username": obj.reply_to.sender.username
+            }
+        return None
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -106,8 +162,23 @@ class ConversationListSerializer(serializers.ModelSerializer):
 
 
     def get_unread_count(self, obj):
+        request = self.context.get("request")
+        if request and hasattr(request, "user"):
+            redis_key = f"chat:unread:{request.user.id}:{obj.id}"
+            count = cache.get(redis_key)
+            if count is not None:
+                return count
+
+        # Fallback to annotation explicitly without triggering per-row DB queries
         if hasattr(obj, 'unread_count_annotated'):
+            if request and hasattr(request, "user"):
+                cache.set(f"chat:unread:{request.user.id}:{obj.id}", obj.unread_count_annotated, timeout=604800)
             return obj.unread_count_annotated
+
+        # Lowest fallback just in case
+        if request and hasattr(request, "user"):
+            return ChatService.get_unread_count(request.user.id, obj.id)
+            
         return 0
 
 
@@ -164,3 +235,10 @@ class PromoteAdminSerializer(serializers.Serializer):
 
 class RemoveAdminSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()
+
+class ForwardMessageSerializer(serializers.Serializer):
+    message_id = serializers.IntegerField()
+    target_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        allow_empty=False
+    )

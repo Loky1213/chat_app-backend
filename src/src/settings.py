@@ -193,3 +193,22 @@ SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(days=3),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
+
+# ==============================
+# 🔹 CENTRALIZED LOGGING
+# ==============================
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+        },
+    },
+    "loggers": {
+        "chat": {
+            "handlers": ["console"],
+            "level": "INFO",
+        },
+    },
+}
