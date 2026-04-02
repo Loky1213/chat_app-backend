@@ -433,9 +433,13 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def increment_connection(self):
+        from django_redis import get_redis_connection
+        redis_conn = get_redis_connection("default")
+
         redis_key = f"global_connections:{self.user.id}"
         cache.set(f"online_user_{self.user.id}", True, timeout=60)
-        
+        redis_conn.sadd("online_users", str(self.user.id))
+
         try:
             return cache.incr(redis_key)
         except ValueError:
@@ -479,6 +483,9 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             if current_count is not None:
                 if int(current_count) <= 0:
                     await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
+                    from django_redis import get_redis_connection
+                    redis_conn = get_redis_connection("default")
+                    redis_conn.srem("online_users", str(self.user.id))
                     
                     await self.channel_layer.group_send(
                         "global_presence",

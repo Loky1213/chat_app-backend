@@ -3,7 +3,8 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.db.models import Count
 from django.core.cache import cache
-from .services import ChatService
+from .services import ChatService, get_user_presence
+from .models import UserReadReceipt
 
 from .models import (
     Conversation,
@@ -25,6 +26,7 @@ class MessageSerializer(serializers.ModelSerializer):
     sender = ChatUserSerializer(read_only=True)
     is_deleted = serializers.SerializerMethodField()
     read_by = serializers.SerializerMethodField()
+    read_receipts_visible = serializers.SerializerMethodField()
     reply_to = serializers.SerializerMethodField()
     reactions = serializers.SerializerMethodField()
 
@@ -40,12 +42,39 @@ class MessageSerializer(serializers.ModelSerializer):
             "created_at",
             "is_deleted",
             "read_by",
+            "read_receipts_visible",
             "is_forwarded",
             "reply_to",
             "reactions",
         ]
 
+    def get_read_receipts_visible(self, obj):
+        request = self.context.get("request")
+        user = None
+
+        if request and hasattr(request, "user"):
+            user = request.user
+        else:
+            user = self.context.get("user")
+
+        if not user:
+            return True
+
+        participants = ConversationParticipant.objects.filter(
+            conversation=obj.conversation
+        ).exclude(user=user).select_related("user__read_receipt")
+
+        for p in participants:
+            rr = getattr(p.user, "read_receipt", None)
+            if rr and not rr.is_enabled:
+                return False
+
+        return True
+
     def get_read_by(self, obj):
+        if not self.get_read_receipts_visible(obj):
+            return []
+
         if hasattr(obj, 'messageread_set'):
             return [mr.user_id for mr in getattr(obj, 'messageread_set').all()]
         return []
@@ -147,7 +176,7 @@ class ConversationListSerializer(serializers.ModelSerializer):
                 "id": p.user.id,
                 "username": p.user.username,
                 "role": p.role,
-                "is_online": bool(cache.get(f"online_user_{p.user.id}"))
+                "is_online": get_user_presence(p.user)
             }
             for p in participants
         ]
@@ -198,7 +227,7 @@ class ConversationDetailSerializer(serializers.ModelSerializer):
 
 
     def get_participants(self, obj):
-        participants = obj.conversationparticipant_set.select_related("user")
+        participants = obj.conversationparticipant_set.select_related("user", "user__presence")
 
         return [
             {
@@ -206,7 +235,7 @@ class ConversationDetailSerializer(serializers.ModelSerializer):
                 "username": p.user.username,
                 "role": p.role,
                 "joined_at": p.joined_at,
-                "is_online": bool(cache.get(f"online_user_{p.user.id}"))
+                "is_online": get_user_presence(p.user)
             }
             for p in participants
         ]

@@ -168,3 +168,33 @@ class MessageReaction(models.Model):
 
     def __str__(self):
         return f"{self.user} reacted {self.emoji} on {self.message_id}"
+
+
+class UserPresence(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="presence")
+    is_online_override = models.BooleanField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user"]),
+        ]
+
+    def __str__(self):
+        return f"Presence for {self.user}"
+
+
+class UserReadReceipt(models.Model):
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="read_receipt"
+    )
+    is_enabled = models.BooleanField(default=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.is_enabled}"

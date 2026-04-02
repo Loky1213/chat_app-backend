@@ -1,12 +1,15 @@
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
-from drf_spectacular.utils import extend_schema, OpenApiResponse
+from drf_spectacular.utils import extend_schema, OpenApiResponse, inline_serializer
+from rest_framework import serializers
 from .models import ConversationParticipant
 from django.core.cache import cache
 from collections import defaultdict
 from django.db.models import Count, Q, F
-from .models import Conversation, Message
+from .models import Conversation, Message, UserPresence, UserReadReceipt
+from rest_framework.response import Response
+from chat.services import get_user_presence
 from .serializers import (
     ConversationListSerializer,
     ConversationDetailSerializer,
@@ -119,7 +122,7 @@ class ConversationListView(APIView):
                 distinct=True
             )
         ).select_related("last_message").prefetch_related(
-            "conversationparticipant_set__user"
+            "conversationparticipant_set__user__presence"
         ).order_by(F("last_message__created_at").desc(nulls_last=True), "-created_at").distinct()
 
         serializer = ConversationListSerializer(
@@ -470,3 +473,171 @@ class ForwardMessageView(APIView):
             errors=serializer.errors,
             status_code=status.HTTP_400_BAD_REQUEST
         )
+
+
+# ==============================
+# 🔹 GET MY PRESENCE
+# ==============================
+class MyPresenceView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Chat"],
+        summary="Get current user presence state"
+    )
+    def get(self, request):
+        user = request.user
+
+        try:
+            is_hidden = user.presence.is_online_override is False
+        except Exception:
+            is_hidden = False
+
+        return Response({
+            "is_online": get_user_presence(user),
+            "is_hidden": is_hidden
+        })
+
+
+# ==============================
+# 🔹 ONLINE USERS (PRESENCE SNAPSHOT)
+# ==============================
+class OnlineUsersView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Chat"],
+        summary="Get all currently online users"
+    )
+    def get(self, request):
+        from django_redis import get_redis_connection
+        redis_conn = get_redis_connection("default")
+
+        # Get all connected users from Redis
+        raw_ids = redis_conn.smembers("online_users")
+        user_ids = [int(uid.decode()) for uid in raw_ids]
+
+        if not user_ids:
+            return Response({"online_users": []})
+
+        # Filter hidden users in ONE DB query (no loops)
+        hidden_user_ids = set(
+            UserPresence.objects.filter(
+                user_id__in=user_ids,
+                is_online_override=False
+            ).values_list("user_id", flat=True)
+        )
+
+        # Remove hidden users
+        visible_users = [
+            str(uid) for uid in user_ids if uid not in hidden_user_ids
+        ]
+
+        return Response({
+            "online_users": visible_users
+        })
+
+
+# ==============================
+# 🔹 TOGGLE PRESENCE
+# ==============================
+class TogglePresenceView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=inline_serializer(
+            name="PresenceToggleRequest",
+            fields={
+                "hide_online": serializers.BooleanField()
+            }
+        ),
+        responses={
+            200: inline_serializer(
+                name="PresenceToggleResponse",
+                fields={
+                    "is_online": serializers.BooleanField(),
+                    "is_hidden": serializers.BooleanField()
+                }
+            )
+        },
+        tags=["Chat"],
+        summary="Toggle user presence visibility"
+    )
+    def post(self, request):
+        hide_online = request.data.get("hide_online")
+
+        if hide_online not in [True, False]:
+            return Response({"error": "hide_online must be true or false"}, status=400)
+
+        user = request.user
+        override = False if hide_online else None
+
+        UserPresence.objects.update_or_create(
+            user=user,
+            defaults={"is_online_override": override}
+        )
+
+        # Refresh the relation so get_user_presence sees updated value
+        user.refresh_from_db()
+
+        final_status = get_user_presence(user)
+
+        # Broadcast update
+        try:
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                "global_presence",
+                {
+                    "type": "presence_update",
+                    "user_id": str(user.id),
+                    "status": "user_online" if final_status else "user_offline"
+                }
+            )
+        except Exception:
+            pass
+
+        return Response({
+            "is_online": final_status,
+            "is_hidden": hide_online
+        })
+
+
+# ==============================
+# 🔹 TOGGLE READ RECEIPTS
+# ==============================
+class ToggleReadReceiptView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=inline_serializer(
+            name="ReadReceiptToggleRequest",
+            fields={
+                "is_enabled": serializers.BooleanField()
+            }
+        ),
+        responses={
+            200: inline_serializer(
+                name="ReadReceiptToggleResponse",
+                fields={
+                    "is_enabled": serializers.BooleanField()
+                }
+            )
+        },
+        tags=["Chat"],
+        summary="Toggle read receipts visibility"
+    )
+    def patch(self, request):
+        value = request.data.get("is_enabled", True)
+
+        if not isinstance(value, bool):
+            return Response(
+                {"error": "is_enabled must be true or false"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        obj, _ = UserReadReceipt.objects.update_or_create(
+            user=request.user,
+            defaults={"is_enabled": value}
+        )
+
+        return Response({"is_enabled": obj.is_enabled})

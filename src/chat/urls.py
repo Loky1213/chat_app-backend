@@ -12,6 +12,10 @@ from .views import (
     RemoveAdminView,
     MarkAsReadView,
     ForwardMessageView,
+    TogglePresenceView,
+    MyPresenceView,
+    OnlineUsersView,
+    ToggleReadReceiptView,
 )
 
 urlpatterns = [
@@ -50,4 +54,16 @@ urlpatterns = [
     # 🔹 FORWARD MESSAGES
     # ==============================
     path("messages/forward/", ForwardMessageView.as_view(), name="forward-messages"),
+
+    # ==============================
+    # 🔹 PRESENCE
+    # ==============================
+    path("presence/me/", MyPresenceView.as_view(), name="my-presence"),
+    path("presence/online-users/", OnlineUsersView.as_view(), name="online-users"),
+    path("presence/toggle/", TogglePresenceView.as_view(), name="toggle-presence"),
+
+    # ==============================
+    # 🔹 READ RECEIPTS TOGGLE
+    # ==============================
+    path("read-receipts/", ToggleReadReceiptView.as_view(), name="read-receipts-toggle"),
 ]

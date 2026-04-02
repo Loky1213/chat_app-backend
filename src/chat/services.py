@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
+def get_user_presence(user):
+    """
+    Returns final online status (bool).
+    - Hidden (is_online_override=False) → always offline
+    - Auto (is_online_override=None) → check Redis
+    """
+    if getattr(user, "presence", None) and user.presence.is_online_override is False:
+        return False
+
+    return bool(cache.get(f"online_user_{user.id}"))
+
+
 class ChatService:
 
     # ==============================
