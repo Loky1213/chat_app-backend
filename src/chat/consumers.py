@@ -22,31 +22,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.user = self.scope["user"]
 
-        # 🔐 Authentication check
         if not self.user or not self.user.is_authenticated:
-            logger.warning(f"Unauthorized WebSocket connection attempt denied.")
+            logger.warning("Unauthorized WebSocket connection attempt denied.")
             await self.close()
             return
 
-        # 📦 Get conversation ID
         self.conversation_id = self.scope["url_route"]["kwargs"].get("conversation_id")
         self.room_group_name = f"chat_{self.conversation_id}"
 
         logger.info(f"CONNECT: user={self.user}, room={self.room_group_name}")
 
-        # 🔒 Authorization check
         is_member = await self.is_participant()
         if not is_member:
             logger.warning(f"User {self.user} NOT authorized to join conversation {self.conversation_id}")
             await self.close()
             return
 
-        # ✅ Join group
-        await self.channel_layer.group_add(
-            self.room_group_name,
-            self.channel_name
-        )
-
+        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
 
         try:
@@ -72,29 +64,21 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 )
             except Exception:
                 pass
-
-            await self.channel_layer.group_discard(
-                self.room_group_name,
-                self.channel_name
-            )
-
+            await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
     async def receive(self, text_data):
         logger.debug(f"RAW DATA received from user {self.user}: {text_data}")
 
-        # 🔒 Safe JSON parsing
         try:
             data = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(text_data=json.dumps({
-                "error": "Invalid JSON format"
-            }))
+            await self.send(text_data=json.dumps({"error": "Invalid JSON format"}))
             return
 
         action = data.get("action")
 
         # ==============================
-        # 🔹 SEND MESSAGE
+        # SEND MESSAGE
         # ==============================
         if action == "send_message":
             message = data.get("message")
@@ -102,23 +86,25 @@ class ChatConsumer(AsyncWebsocketConsumer):
             reply_to_id = data.get("reply_to")
 
             if not message:
-                await self.send(text_data=json.dumps({
-                    "error": "Message content is required"
-                }))
+                await self.send(text_data=json.dumps({"error": "Message content is required"}))
                 return
 
-            # Ensure sender unread count is always 0
             await self.reset_unread_count(self.user.id)
-
             saved_message = await self.save_message(message, message_type, reply_to_id=reply_to_id)
 
-            # Issue 2: Duplicate WS event protection
             redis_key = f"ws_sent:{saved_message['id']}:{self.conversation_id}"
             is_sent = await sync_to_async(cache.get)(redis_key)
-            
+
             if not is_sent:
                 await sync_to_async(cache.set)(redis_key, True, timeout=5)
 
+                # ── Chat room members get type: "message" (the primary message event) ──
+                # This is the ONLY event broadcast to the chat room group for new messages.
+                #
+                # FIX: Previously we also sent a "new_message" event to the room group,
+                # which meant every chat room member received BOTH "message" AND "new_message"
+                # for the same send. The frontend processed both and inserted the message twice.
+                # Now only "message" goes to the room; "new_message" goes to user_ groups only.
                 await self.channel_layer.group_send(
                     self.room_group_name,
                     {
@@ -127,31 +113,57 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     }
                 )
 
-                # 🔹 BROADCAST NOTIFICATION TO ALL PARTICIPANTS
+                # ── Per-user notification groups get type: "new_message" ──
+                # These are received by the global NotificationConsumer (useGlobalWebSocket).
+                # They update the sidebar only — NOT the message list.
                 participants = await self.get_conversation_participants()
                 for p_id in participants:
                     if str(p_id) != str(self.user.id):
-                        # Issue 4: Ensure other participants' unread counts are incremented
                         unread_count = await self.increment_unread_count(str(p_id))
-                        
-                        # Issue 3: Weak Notification Payload + Issue 5
+
                         await self.channel_layer.group_send(
                             f"user_{p_id}",
                             {
                                 "type": "new_message",
                                 "conversation_id": self.conversation_id,
                                 "last_message": {
+                                    "id": saved_message["id"],
                                     "content": saved_message["content"],
                                     "created_at": saved_message["created_at"],
-                                    "sender_id": str(saved_message["sender"]["id"]),
-                                    "is_forwarded": saved_message.get("is_forwarded", False)
+                                    # FIX: include full sender object so normalizeMessage
+                                    # can parse msg.sender on the frontend
+                                    "sender": saved_message["sender"],
+                                    "conversation_id": self.conversation_id,
+                                    "message_type": saved_message.get("message_type", "text"),
+                                    "is_forwarded": saved_message.get("is_forwarded", False),
                                 },
                                 "unread_count": unread_count
                             }
                         )
 
+                # ── The sender's own notification group also gets a sidebar update ──
+                # This keeps the sender's sidebar order/last_message in sync without
+                # relying solely on the optimistic updateConversationOnSend.
+                await self.channel_layer.group_send(
+                    f"user_{self.user.id}",
+                    {
+                        "type": "new_message",
+                        "conversation_id": self.conversation_id,
+                        "last_message": {
+                            "id": saved_message["id"],
+                            "content": saved_message["content"],
+                            "created_at": saved_message["created_at"],
+                            "sender": saved_message["sender"],
+                            "conversation_id": self.conversation_id,
+                            "message_type": saved_message.get("message_type", "text"),
+                            "is_forwarded": saved_message.get("is_forwarded", False),
+                        },
+                        "unread_count": 0  # sender always has 0 unread
+                    }
+                )
+
         # ==============================
-        # 🔹 DELETE MESSAGE
+        # DELETE MESSAGE
         # ==============================
         elif action == "delete_message":
             message_id = data.get("message_id")
@@ -163,16 +175,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             try:
                 await self.delete_message_action(message_id, mode)
-                
-                # Broadcast for everyone, or send back to sender for "me"
+
                 if mode == "everyone":
                     await self.channel_layer.group_send(
                         self.room_group_name,
-                        {
-                            "type": "message_deleted_event",
-                            "message_id": message_id,
-                            "mode": mode
-                        }
+                        {"type": "message_deleted_event", "message_id": message_id, "mode": mode}
                     )
                 else:
                     await self.send(text_data=json.dumps({
@@ -185,7 +192,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 await self.send(text_data=json.dumps({"error": str(e)}))
 
         # ==============================
-        # 🔹 REACTION TRIGGER
+        # REACTION
         # ==============================
         elif action == "react":
             message_id = data.get("message_id")
@@ -200,7 +207,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 await self.send(text_data=json.dumps({"error": "Invalid reaction payload"}))
                 return
 
-            # Dedup: prevent rapid duplicate broadcasts
             dedup_key = f"reaction_ws:{message_id}:{emoji}:{self.user.id}"
             is_dup = await sync_to_async(cache.get)(dedup_key)
             if is_dup:
@@ -208,79 +214,56 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             try:
                 reactions = await sync_to_async(ChatService.toggle_reaction)(self.user, message_id, emoji)
-
                 await sync_to_async(cache.set)(dedup_key, True, timeout=3)
-
                 await self.channel_layer.group_send(
                     self.room_group_name,
-                    {
-                        "type": "reaction_update_event",
-                        "message_id": message_id,
-                        "reactions": reactions
-                    }
+                    {"type": "reaction_update_event", "message_id": message_id, "reactions": reactions}
                 )
             except Exception as e:
                 await self.send(text_data=json.dumps({"error": str(e)}))
 
         # ==============================
-        # 🔹 MARK AS READ
+        # MARK AS READ
         # ==============================
         elif action == "mark_read":
             message_id = data.get("message_id")
 
             try:
-                # Reset Redis unread count (O(1) performance)
                 await self.reset_unread_count(self.user.id)
 
                 if message_id:
                     await self.mark_message_seen_action(message_id)
                     await self.channel_layer.group_send(
                         self.room_group_name,
-                        {
-                            "type": "message_seen_event",
-                            "message_id": message_id,
-                            "user_id": str(self.user.id)
-                        }
+                        {"type": "message_seen_event", "message_id": message_id, "user_id": str(self.user.id)}
                     )
                 else:
-                    # Legacy fallback
                     await self.mark_as_read()
                     await self.channel_layer.group_send(
                         self.room_group_name,
-                        {
-                            "type": "read_receipt",
-                            "user_id": str(self.user.id)
-                        }
+                        {"type": "read_receipt", "user_id": str(self.user.id)}
                     )
             except Exception as e:
                 logger.error(f"Error marking as read for user {self.user}: {str(e)}", exc_info=True)
 
         # ==============================
-        # 🔹 TYPING
+        # TYPING
         # ==============================
         elif action == "typing":
             await self.channel_layer.group_send(
                 self.room_group_name,
-                {
-                    "type": "user_typing_event",
-                    "user_id": str(self.user.id)
-                }
+                {"type": "user_typing_event", "user_id": str(self.user.id)}
             )
 
         else:
-            await self.send(text_data=json.dumps({
-                "error": "Invalid action"
-            }))
-
+            await self.send(text_data=json.dumps({"error": "Invalid action"}))
 
     # ==============================
-    # 🔹 RECEIVE MESSAGE (BROADCAST)
+    # BROADCAST HANDLERS
     # ==============================
+
     async def chat_message(self, event):
-        await self.send(text_data=json.dumps({
-            "type": "message",
-            "data": event["data"]
-        }))
+        await self.send(text_data=json.dumps({"type": "message", "data": event["data"]}))
 
     async def reaction_update_event(self, event):
         await self.send(text_data=json.dumps({
@@ -289,14 +272,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "reactions": event["reactions"]
         }))
 
-    # ==============================
-    # 🔹 READ RECEIPT BROADCAST
-    # ==============================
     async def read_receipt(self, event):
-        await self.send(text_data=json.dumps({
-            "type": "read_receipt",
-            "user_id": event["user_id"]
-        }))
+        await self.send(text_data=json.dumps({"type": "read_receipt", "user_id": event["user_id"]}))
 
     async def message_deleted_event(self, event):
         await self.send(text_data=json.dumps({
@@ -313,15 +290,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     async def user_typing_event(self, event):
+        # Don't echo back to sender
         if event["user_id"] != str(self.user.id):
-            await self.send(text_data=json.dumps({
-                "type": "typing",
-                "user_id": event["user_id"]
-            }))
-
+            await self.send(text_data=json.dumps({"type": "typing", "user_id": event["user_id"]}))
 
     # ==============================
-    # 🔹 DATABASE OPERATIONS
+    # DATABASE OPERATIONS
     # ==============================
 
     @database_sync_to_async
@@ -330,7 +304,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             user=self.user,
             conversation_id=self.conversation_id
         ).exists()
-
 
     @database_sync_to_async
     def save_message(self, content, message_type, reply_to_id=None):
@@ -341,32 +314,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message_type=message_type,
             reply_to_id=reply_to_id
         )
-
         from .serializers import MessageSerializer
         return MessageSerializer(message, context={"request": None}).data
 
-
     @database_sync_to_async
     def mark_as_read(self):
-        ChatService.mark_as_read(
-            user=self.user,
-            conversation_id=self.conversation_id
-        )
+        ChatService.mark_as_read(user=self.user, conversation_id=self.conversation_id)
 
     @database_sync_to_async
     def delete_message_action(self, message_id, mode):
-        ChatService.delete_message(
-            request_user=self.user,
-            message_id=message_id,
-            mode=mode
-        )
+        ChatService.delete_message(request_user=self.user, message_id=message_id, mode=mode)
 
     @database_sync_to_async
     def mark_message_seen_action(self, message_id):
-        ChatService.mark_message_seen(
-            user=self.user,
-            message_id=message_id
-        )
+        ChatService.mark_message_seen(user=self.user, message_id=message_id)
 
     @database_sync_to_async
     def get_conversation_participants(self):
@@ -395,51 +356,31 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
         self.user_group_name = f"user_{self.user.id}"
 
-        # Join personal user group for notifications
-        await self.channel_layer.group_add(
-            self.user_group_name,
-            self.channel_name
-        )
-
-        # Join global presence group
-        await self.channel_layer.group_add(
-            "global_presence",
-            self.channel_name
-        )
-
+        await self.channel_layer.group_add(self.user_group_name, self.channel_name)
+        await self.channel_layer.group_add("global_presence", self.channel_name)
         await self.accept()
+
         logger.info(f"Notification CONNECT: user={self.user}, group={self.user_group_name}")
 
         try:
-            log_chat_event(
-                action="WS_EVENT",
-                user_id=self.user.id,
-                extra={"event": "notification_connect"}
-            )
+            log_chat_event(action="WS_EVENT", user_id=self.user.id, extra={"event": "notification_connect"})
         except Exception:
             pass
 
         conn_count = await self.increment_connection()
-        
         if conn_count == 1:
             await self.channel_layer.group_send(
                 "global_presence",
-                {
-                    "type": "presence_update",
-                    "user_id": str(self.user.id),
-                    "status": "user_online"
-                }
+                {"type": "presence_update", "user_id": str(self.user.id), "status": "user_online"}
             )
 
     @database_sync_to_async
     def increment_connection(self):
         from django_redis import get_redis_connection
         redis_conn = get_redis_connection("default")
-
         redis_key = f"global_connections:{self.user.id}"
         cache.set(f"online_user_{self.user.id}", True, timeout=60)
         redis_conn.sadd("online_users", str(self.user.id))
-
         try:
             return cache.incr(redis_key)
         except ValueError:
@@ -463,48 +404,29 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         logger.info(f"Notification DISCONNECT: user={self.user}, code={close_code}")
 
         try:
-            log_chat_event(
-                action="WS_EVENT",
-                user_id=self.user.id,
-                extra={"event": "notification_disconnect", "code": close_code}
-            )
+            log_chat_event(action="WS_EVENT", user_id=self.user.id, extra={"event": "notification_disconnect", "code": close_code})
         except Exception:
             pass
-        
-        if hasattr(self, "user_group_name"):
-            conn_count = await self.decrement_connection()
 
-            # Delay to avoid flicker on immediate reload
-            await asyncio.sleep(1.5)
+        if hasattr(self, "user_group_name"):
+            await self.decrement_connection()
+            await asyncio.sleep(1.5)  # delay to avoid flicker on page reload
 
             redis_key = f"global_connections:{self.user.id}"
             current_count = await sync_to_async(cache.get)(redis_key)
 
-            if current_count is not None:
-                if int(current_count) <= 0:
-                    await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
-                    from django_redis import get_redis_connection
-                    redis_conn = get_redis_connection("default")
-                    redis_conn.srem("online_users", str(self.user.id))
-                    
-                    await self.channel_layer.group_send(
-                        "global_presence",
-                        {
-                            "type": "presence_update",
-                            "user_id": str(self.user.id),
-                            "status": "user_offline"
-                        }
-                    )
+            if current_count is not None and int(current_count) <= 0:
+                await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
+                from django_redis import get_redis_connection
+                redis_conn = get_redis_connection("default")
+                redis_conn.srem("online_users", str(self.user.id))
+                await self.channel_layer.group_send(
+                    "global_presence",
+                    {"type": "presence_update", "user_id": str(self.user.id), "status": "user_offline"}
+                )
 
-            await self.channel_layer.group_discard(
-                self.user_group_name,
-                self.channel_name
-            )
-
-            await self.channel_layer.group_discard(
-                "global_presence",
-                self.channel_name
-            )
+            await self.channel_layer.group_discard(self.user_group_name, self.channel_name)
+            await self.channel_layer.group_discard("global_presence", self.channel_name)
 
     async def receive(self, text_data):
         try:
@@ -531,7 +453,6 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         }
         if "unread_count" in event:
             payload["unread_count"] = event["unread_count"]
-
         await self.send(text_data=json.dumps(payload))
 
     async def unread_reset(self, event):
@@ -539,275 +460,3 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             "type": "unread_reset",
             "conversation_id": event["conversation_id"]
         }))
-
-
-
-# import json
-# from channels.generic.websocket import AsyncWebsocketConsumer
-# from channels.db import database_sync_to_async
-
-# from django.contrib.auth import get_user_model
-# from .models import ConversationParticipant
-# from .services import ChatService
-
-# User = get_user_model()
-
-
-# class ChatConsumer(AsyncWebsocketConsumer):
-
-#     async def connect(self):
-#         self.user = self.scope["user"]
-
-#         if not self.user.is_authenticated:
-#             await self.close()
-#             return
-
-#         self.conversation_id = self.scope["url_route"]["kwargs"]["conversation_id"]
-#         self.room_group_name = f"chat_{self.conversation_id}"
-
-#         # 🔒 Check if user is part of conversation
-#         is_member = await self.is_participant()
-
-#         if not is_member:
-#             await self.close()
-#             return
-
-#         # Join room
-#         await self.channel_layer.group_add(
-#             self.room_group_name,
-#             self.channel_name
-#         )
-
-#         await self.accept()
-
-
-#     async def disconnect(self, close_code):
-#         await self.channel_layer.group_discard(
-#             self.room_group_name,
-#             self.channel_name
-#         )
-
-
-#     async def receive(self, text_data):
-#         data = json.loads(text_data)
-
-#         action = data.get("action")
-
-#         # ==============================
-#         # 🔹 SEND MESSAGE
-#         # ==============================
-#         if action == "send_message":
-#             message = data.get("message")
-#             message_type = data.get("type", "text")
-
-#             saved_message = await self.save_message(message, message_type)
-
-#             await self.channel_layer.group_send(
-#                 self.room_group_name,
-#                 {
-#                     "type": "chat_message",
-#                     "data": saved_message
-#                 }
-#             )
-
-#         # ==============================
-#         # 🔹 MARK AS READ
-#         # ==============================
-#         elif action == "mark_read":
-#             await self.mark_as_read()
-
-#             await self.channel_layer.group_send(
-#                 self.room_group_name,
-#                 {
-#                     "type": "read_receipt",
-#                     "user_id": str(self.user.id)
-#                 }
-#             )
-
-
-#     # ==============================
-#     # 🔹 RECEIVE MESSAGE (BROADCAST)
-#     # ==============================
-#     async def chat_message(self, event):
-#         await self.send(text_data=json.dumps({
-#             "type": "message",
-#             "data": event["data"]
-#         }))
-
-
-#     # ==============================
-#     # 🔹 READ RECEIPT BROADCAST
-#     # ==============================
-#     async def read_receipt(self, event):
-#         await self.send(text_data=json.dumps({
-#             "type": "read_receipt",
-#             "user_id": event["user_id"]
-#         }))
-
-
-#     # ==============================
-#     # 🔹 DATABASE OPERATIONS
-#     # ==============================
-
-#     @database_sync_to_async
-#     def is_participant(self):
-#         return ConversationParticipant.objects.filter(
-#             user=self.user,
-#             conversation_id=self.conversation_id
-#         ).exists()
-
-
-#     @database_sync_to_async
-#     def save_message(self, content, message_type):
-#         message = ChatService.send_message(
-#             user=self.user,
-#             conversation_id=self.conversation_id,
-#             content=content,
-#             message_type=message_type
-#         )
-
-#         return {
-#             "id": str(message.id),
-#             "content": message.content,
-#             "message_type": message.message_type,
-#             "sender": {
-#                 "id": str(self.user.id),
-#                 "username": self.user.username
-#             },
-#             "created_at": str(message.created_at)
-#         }
-
-
-#     @database_sync_to_async
-#     def mark_as_read(self):
-#         ChatService.mark_as_read(
-#             user=self.user,
-#             conversation_id=self.conversation_id
-#         )
-
-
-
-
-
-
-
-# import json
-# from channels.generic.websocket import AsyncWebsocketConsumer
-
-
-# class ChatConsumer(AsyncWebsocketConsumer):
-
-#     async def connect(self):
-#         # 👇 Ignore authentication for now
-#         self.user = self.scope.get("user", None)
-#         print("🔥 CONNECT HIT | USER:", self.user)
-
-#         # 👇 Get conversation id safely
-#         self.conversation_id = self.scope["url_route"]["kwargs"].get("conversation_id", "test")
-#         self.room_group_name = f"chat_{self.conversation_id}"
-
-#         print("📡 ROOM:", self.room_group_name)
-
-#         # 👇 Accept connection immediately
-#         await self.accept()
-
-#         # 👇 Join group (no Redis needed yet, but safe)
-#         try:
-#             await self.channel_layer.group_add(
-#                 self.room_group_name,
-#                 self.channel_name
-#             )
-#         except Exception as e:
-#             print("⚠️ Group add failed (ignore for now):", e)
-
-
-#     async def disconnect(self, close_code):
-#         print("🔌 DISCONNECTED")
-
-#         try:
-#             await self.channel_layer.group_discard(
-#                 self.room_group_name,
-#                 self.channel_name
-#             )
-#         except Exception:
-#             pass
-
-
-#     async def receive(self, text_data):
-#         print("📩 RECEIVED:", text_data)
-
-#         data = json.loads(text_data)
-
-#         # 👇 Echo back (simple test)
-#         await self.send(text_data=json.dumps({
-#             "message": data.get("message", "No message received"),
-#             "status": "ok"
-#         })) "created_at": str(message.created_at)
-#         }
-
-
-#     @database_sync_to_async
-#     def mark_as_read(self):
-#         ChatService.mark_as_read(
-#             user=self.user,
-#             conversation_id=self.conversation_id
-#         )
-
-
-
-
-
-
-
-# import json
-# from channels.generic.websocket import AsyncWebsocketConsumer
-
-
-# class ChatConsumer(AsyncWebsocketConsumer):
-
-#     async def connect(self):
-#         # 👇 Ignore authentication for now
-#         self.user = self.scope.get("user", None)
-#         print("🔥 CONNECT HIT | USER:", self.user)
-
-#         # 👇 Get conversation id safely
-#         self.conversation_id = self.scope["url_route"]["kwargs"].get("conversation_id", "test")
-#         self.room_group_name = f"chat_{self.conversation_id}"
-
-#         print("📡 ROOM:", self.room_group_name)
-
-#         # 👇 Accept connection immediately
-#         await self.accept()
-
-#         # 👇 Join group (no Redis needed yet, but safe)
-#         try:
-#             await self.channel_layer.group_add(
-#                 self.room_group_name,
-#                 self.channel_name
-#             )
-#         except Exception as e:
-#             print("⚠️ Group add failed (ignore for now):", e)
-
-
-#     async def disconnect(self, close_code):
-#         print("🔌 DISCONNECTED")
-
-#         try:
-#             await self.channel_layer.group_discard(
-#                 self.room_group_name,
-#                 self.channel_name
-#             )
-#         except Exception:
-#             pass
-
-
-#     async def receive(self, text_data):
-#         print("📩 RECEIVED:", text_data)
-
-#         data = json.loads(text_data)
-
-#         # 👇 Echo back (simple test)
-#         await self.send(text_data=json.dumps({
-#             "message": data.get("message", "No message received"),
-#             "status": "ok"
-#         }))
