@@ -8,8 +8,8 @@ from django.core.cache import cache
 from asgiref.sync import sync_to_async
 import logging
 
-from .models import ConversationParticipant, Message
-from .services import ChatService
+from .models import ConversationParticipant, Message, UserPresence
+from .services import ChatService, get_user_presence
 from .utils.logger import log_chat_event
 
 logger = logging.getLogger(__name__)
@@ -367,8 +367,13 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         except Exception:
             pass
 
-        conn_count = await self.increment_connection()
-        if conn_count == 1:
+        conn_count, is_visible = await self.increment_connection()
+        if conn_count == 1 and is_visible:
+            # Only broadcast online if user is visible AND not already marked online
+            # (prevents duplicate broadcasts on rapid reconnects)
+            already_online = await sync_to_async(cache.get)(f"online_user_{self.user.id}")
+            if not already_online:
+                await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=60)
             await self.channel_layer.group_send(
                 "global_presence",
                 {"type": "presence_update", "user_id": str(self.user.id), "status": "user_online"}
@@ -379,13 +384,27 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         from django_redis import get_redis_connection
         redis_conn = get_redis_connection("default")
         redis_key = f"global_connections:{self.user.id}"
-        cache.set(f"online_user_{self.user.id}", True, timeout=60)
-        redis_conn.sadd("online_users", str(self.user.id))
+
+        # Check if user is visible (privacy setting)
+        is_visible = True
         try:
-            return cache.incr(redis_key)
+            presence = UserPresence.objects.get(user_id=self.user.id)
+            is_visible = presence.is_visible
+        except UserPresence.DoesNotExist:
+            pass
+
+        # Only set Redis keys if user is visible
+        if is_visible:
+            cache.set(f"online_user_{self.user.id}", True, timeout=60)
+            redis_conn.sadd("online_users", str(self.user.id))
+
+        try:
+            conn_count = cache.incr(redis_key)
         except ValueError:
             cache.set(redis_key, 1, timeout=86400)
-            return 1
+            conn_count = 1
+
+        return conn_count, is_visible
 
     @database_sync_to_async
     def decrement_connection(self):
@@ -416,14 +435,20 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             current_count = await sync_to_async(cache.get)(redis_key)
 
             if current_count is not None and int(current_count) <= 0:
+                # Check if user was visible (only broadcast offline if they were visible)
+                was_online = await sync_to_async(cache.get)(f"online_user_{self.user.id}")
+                
                 await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
                 from django_redis import get_redis_connection
                 redis_conn = get_redis_connection("default")
                 redis_conn.srem("online_users", str(self.user.id))
-                await self.channel_layer.group_send(
-                    "global_presence",
-                    {"type": "presence_update", "user_id": str(self.user.id), "status": "user_offline"}
-                )
+                
+                # Only broadcast offline if user was actually online (prevents duplicate offline events)
+                if was_online:
+                    await self.channel_layer.group_send(
+                        "global_presence",
+                        {"type": "presence_update", "user_id": str(self.user.id), "status": "user_offline"}
+                    )
 
             await self.channel_layer.group_discard(self.user_group_name, self.channel_name)
             await self.channel_layer.group_discard("global_presence", self.channel_name)
@@ -435,8 +460,23 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             return
 
         if data.get("action") == "ping":
-            await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=60)
+            # Only refresh online status if user is visible
+            is_visible = await self._check_user_visibility()
+            if is_visible:
+                from django_redis import get_redis_connection
+                redis_conn = get_redis_connection("default")
+                await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=60)
+                redis_conn.sadd("online_users", str(self.user.id))
             await self.send(text_data=json.dumps({"type": "pong"}))
+
+    @database_sync_to_async
+    def _check_user_visibility(self):
+        """Check if user has is_visible=True (privacy setting)."""
+        try:
+            presence = UserPresence.objects.get(user_id=self.user.id)
+            return presence.is_visible
+        except UserPresence.DoesNotExist:
+            return True
 
     async def presence_update(self, event):
         await self.send(text_data=json.dumps({

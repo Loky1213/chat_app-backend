@@ -36,12 +36,16 @@ User = get_user_model()
 def get_user_presence(user):
     """
     Returns final online status (bool).
-    - Hidden (is_online_override=False) → always offline
-    - Auto (is_online_override=None) → check Redis
+    - is_visible=False → always appear offline (privacy mode)
+    - is_visible=True → check Redis for real-time status
     """
-    if getattr(user, "presence", None) and user.presence.is_online_override is False:
+    presence = getattr(user, "presence", None)
+
+    # Privacy override: hidden users always appear offline
+    if presence and presence.is_visible is False:
         return False
 
+    # Real-time presence via Redis
     return bool(cache.get(f"online_user_{user.id}"))
 
 

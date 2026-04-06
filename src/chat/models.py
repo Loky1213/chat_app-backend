@@ -172,7 +172,7 @@ class MessageReaction(models.Model):
 
 class UserPresence(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="presence")
-    is_online_override = models.BooleanField(null=True, blank=True)
+    is_visible = models.BooleanField(default=True)
 
     class Meta:
         indexes = [

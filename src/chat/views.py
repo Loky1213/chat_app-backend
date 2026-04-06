@@ -489,13 +489,13 @@ class MyPresenceView(APIView):
         user = request.user
 
         try:
-            is_hidden = user.presence.is_online_override is False
+            is_visible = user.presence.is_visible
         except Exception:
-            is_hidden = False
+            is_visible = True
 
         return Response({
             "is_online": get_user_presence(user),
-            "is_hidden": is_hidden
+            "is_visible": is_visible
         })
 
 
@@ -524,7 +524,7 @@ class OnlineUsersView(APIView):
         hidden_user_ids = set(
             UserPresence.objects.filter(
                 user_id__in=user_ids,
-                is_online_override=False
+                is_visible=False
             ).values_list("user_id", flat=True)
         )
 
@@ -548,58 +548,72 @@ class TogglePresenceView(APIView):
         request=inline_serializer(
             name="PresenceToggleRequest",
             fields={
-                "hide_online": serializers.BooleanField()
+                "is_visible": serializers.BooleanField()
             }
         ),
         responses={
             200: inline_serializer(
                 name="PresenceToggleResponse",
                 fields={
-                    "is_online": serializers.BooleanField(),
-                    "is_hidden": serializers.BooleanField()
+                    "is_visible": serializers.BooleanField()
                 }
             )
         },
         tags=["Chat"],
         summary="Toggle user presence visibility"
     )
-    def post(self, request):
-        hide_online = request.data.get("hide_online")
+    def patch(self, request):
+        from django_redis import get_redis_connection
 
-        if hide_online not in [True, False]:
-            return Response({"error": "hide_online must be true or false"}, status=400)
+        is_visible = request.data.get("is_visible")
+
+        if not isinstance(is_visible, bool):
+            return Response({"error": "is_visible must be true or false"}, status=400)
 
         user = request.user
-        override = False if hide_online else None
 
-        UserPresence.objects.update_or_create(
-            user=user,
-            defaults={"is_online_override": override}
-        )
+        presence, _ = UserPresence.objects.get_or_create(user=user)
+        
+        # Track previous state for duplicate broadcast prevention
+        was_online = bool(cache.get(f"online_user_{user.id}"))
+        
+        presence.is_visible = is_visible
+        presence.save()
 
-        # Refresh the relation so get_user_presence sees updated value
+        # Instant Redis sync
+        redis_conn = get_redis_connection("default")
+
+        if not is_visible:
+            # Hide immediately: remove from Redis
+            cache.delete(f"online_user_{user.id}")
+            redis_conn.srem("online_users", str(user.id))
+        else:
+            # Restore if user has active WebSocket connections
+            conn_count = cache.get(f"global_connections:{user.id}")
+            if conn_count and int(conn_count) > 0:
+                cache.set(f"online_user_{user.id}", True, timeout=60)
+                redis_conn.sadd("online_users", str(user.id))
+
+        # Refresh and get final status
         user.refresh_from_db()
-
         final_status = get_user_presence(user)
 
-        # Broadcast update
+        # Broadcast update only if state actually changed (prevents duplicate events)
         try:
-            channel_layer = get_channel_layer()
-            async_to_sync(channel_layer.group_send)(
-                "global_presence",
-                {
-                    "type": "presence_update",
-                    "user_id": str(user.id),
-                    "status": "user_online" if final_status else "user_offline"
-                }
-            )
+            if was_online != final_status:
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    "global_presence",
+                    {
+                        "type": "presence_update",
+                        "user_id": str(user.id),
+                        "status": "user_online" if final_status else "user_offline"
+                    }
+                )
         except Exception:
             pass
 
-        return Response({
-            "is_online": final_status,
-            "is_hidden": hide_online
-        })
+        return Response({"is_visible": presence.is_visible})
 
 
 # ==============================
