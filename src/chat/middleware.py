@@ -36,7 +36,7 @@ class JwtAuthMiddleware(BaseMiddleware):
                 print(" RAW USER ID:", user_id)
 
                 if user_id is not None:
-                    user_id = int(user_id)  # ✅ CRITICAL FIX
+                    user_id = int(user_id)  
 
                 user = await get_user(user_id)
                 logger.info(f"WebSocket Authenticated: User {user}")

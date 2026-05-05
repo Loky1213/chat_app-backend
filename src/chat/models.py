@@ -1,6 +1,6 @@
 from django.db import models
 from django.conf import settings
-import uuid
+
 
 User = settings.AUTH_USER_MODEL
 
@@ -10,7 +10,7 @@ class Conversation(models.Model):
         ("group", "Group"),
     )
 
-    # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
     id = models.AutoField(primary_key=True)
     type = models.CharField(max_length=10, choices=TYPE_CHOICES)
 
@@ -80,7 +80,7 @@ class Message(models.Model):
         ("file", "File"),
     )
 
-    # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
     id = models.AutoField(primary_key=True)
 
     conversation = models.ForeignKey(

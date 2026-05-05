@@ -8,6 +8,7 @@ from django.core.cache import cache
 from asgiref.sync import sync_to_async
 import logging
 
+from .serializers import MessageSerializer
 from .models import ConversationParticipant, Message, UserPresence
 from .services import ChatService, get_user_presence
 from .utils.logger import log_chat_event
@@ -314,7 +315,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message_type=message_type,
             reply_to_id=reply_to_id
         )
-        from .serializers import MessageSerializer
+       
         return MessageSerializer(message, context={"request": None}).data
 
     @database_sync_to_async
@@ -438,10 +439,7 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                 # Check if user was visible (only broadcast offline if they were visible)
                 was_online = await sync_to_async(cache.get)(f"online_user_{self.user.id}")
                 
-                await sync_to_async(cache.delete)(f"online_user_{self.user.id}")
-                from django_redis import get_redis_connection
-                redis_conn = get_redis_connection("default")
-                redis_conn.srem("online_users", str(self.user.id))
+                await self._clear_presence()
                 
                 # Only broadcast offline if user was actually online (prevents duplicate offline events)
                 if was_online:
@@ -463,11 +461,24 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             # Only refresh online status if user is visible
             is_visible = await self._check_user_visibility()
             if is_visible:
-                from django_redis import get_redis_connection
-                redis_conn = get_redis_connection("default")
-                await sync_to_async(cache.set)(f"online_user_{self.user.id}", True, timeout=60)
-                redis_conn.sadd("online_users", str(self.user.id))
+                await self._refresh_presence()
             await self.send(text_data=json.dumps({"type": "pong"}))
+
+    @database_sync_to_async
+    def _refresh_presence(self):
+        """Refresh Redis presence keys (TTL + set membership)."""
+        from django_redis import get_redis_connection
+        redis_conn = get_redis_connection("default")
+        cache.set(f"online_user_{self.user.id}", True, timeout=60)
+        redis_conn.sadd("online_users", str(self.user.id))
+
+    @database_sync_to_async
+    def _clear_presence(self):
+        """Remove user from Redis presence tracking."""
+        from django_redis import get_redis_connection
+        redis_conn = get_redis_connection("default")
+        cache.delete(f"online_user_{self.user.id}")
+        redis_conn.srem("online_users", str(self.user.id))
 
     @database_sync_to_async
     def _check_user_visibility(self):
