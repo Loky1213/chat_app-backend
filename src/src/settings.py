@@ -93,6 +93,19 @@ CHANNEL_LAYERS = {
 }
 
 # ==============================
+# 🗄️ CACHING (DJANGO-REDIS)
+# ==============================
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        }
+    }
+}
+
+# ==============================
 # 🗄 DATABASE
 # ==============================
 DATABASES = {
