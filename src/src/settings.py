@@ -9,9 +9,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ==============================
 SECRET_KEY = 'django-insecure-5t-0l%p$hyo*1p9g@*yo6m_y8spd1lpu&1x=-_fx&i+*pfz_-('
 
-DEBUG = False  # ✅ IMPORTANT
+DEBUG = os.environ.get("DEBUG", "True") == "True"
 
-ALLOWED_HOSTS = ["*"]  # ✅ Replace with your domain later
+ALLOWED_HOSTS = ["*"]
 
 AUTH_USER_MODEL = 'user.User'
 
@@ -80,28 +80,51 @@ TEMPLATES = [
 ASGI_APPLICATION = "src.asgi.application"
 
 # ==============================
-# 🔴 REDIS (PRODUCTION READY)
+# 🔴 REDIS (AUTO SWITCH LOCAL/PROD)
 # ==============================
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
+REDIS_URL = os.environ.get("REDIS_URL")
 
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [REDIS_URL],
+if REDIS_URL:
+    # ✅ Production (Render)
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [REDIS_URL],
+            },
         },
-    },
-}
+    }
 
-CACHES = {
-    "default": {
-        "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": REDIS_URL,
-        "OPTIONS": {
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": REDIS_URL,
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            }
         }
     }
-}
+
+else:
+    # ✅ Local development
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [("127.0.0.1", 6379)],
+            },
+        },
+    }
+
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": "redis://127.0.0.1:6379/1",
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            }
+        }
+    }
 
 # ==============================
 # 🗄 DATABASE
@@ -132,11 +155,19 @@ USE_I18N = True
 USE_TZ = True
 
 # ==============================
-# 🌐 CORS (IMPORTANT FOR VERCEL)
+# 🌐 CORS (AUTO LOCAL + PROD)
 # ==============================
-CORS_ALLOW_ALL_ORIGINS = True  # You can restrict later
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "https://chat-app-frontend-ncgw-7ktd614lv.vercel.app",
+]
 
 CORS_ALLOW_CREDENTIALS = True
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:3000",
+    "https://chat-app-frontend-ncgw-7ktd614lv.vercel.app",
+]
 
 # ==============================
 # 📦 STATIC FILES
