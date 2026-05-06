@@ -19,6 +19,7 @@ AUTH_USER_MODEL = 'user.User'
 # 🔧 APPS
 # ==============================
 INSTALLED_APPS = [
+    'daphne',  # IMPORTANT: keep at top
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -27,7 +28,6 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     # Third-party
-    'daphne',
     'channels',
     'channels_redis',
     'django_redis',
@@ -75,59 +75,38 @@ TEMPLATES = [
 ]
 
 # ==============================
-# ⚡ ASGI (WebSockets)
+# ⚡ ASGI
 # ==============================
 ASGI_APPLICATION = "src.asgi.application"
 
 # ==============================
-# 🔴 REDIS (AUTO SWITCH LOCAL/PROD)
+# 🔴 REDIS (SAFE CONFIG)
 # ==============================
-REDIS_URL = os.environ.get("REDIS_URL")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
 
-if REDIS_URL:
-    # ✅ Production (Render)
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {
-                "hosts": [REDIS_URL],
-            },
+print("REDIS_URL:", REDIS_URL)  # DEBUG (remove later)
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [REDIS_URL],
         },
-    }
+    },
+}
 
-    CACHES = {
-        "default": {
-            "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": REDIS_URL,
-            "OPTIONS": {
-                "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            }
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
         }
     }
-
-else:
-    # ✅ Local development
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {
-                "hosts": [("127.0.0.1", 6379)],
-            },
-        },
-    }
-
-    CACHES = {
-        "default": {
-            "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": "redis://127.0.0.1:6379/1",
-            "OPTIONS": {
-                "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            }
-        }
-    }
+}
 
 # ==============================
-# 🗄 DATABASE
+# 🗄 DATABASE (SQLite OK for now)
 # ==============================
 DATABASES = {
     'default': {
@@ -155,7 +134,7 @@ USE_I18N = True
 USE_TZ = True
 
 # ==============================
-# 🌐 CORS (AUTO LOCAL + PROD)
+# 🌐 CORS
 # ==============================
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -170,7 +149,7 @@ CSRF_TRUSTED_ORIGINS = [
 ]
 
 # ==============================
-# 📦 STATIC FILES
+# 📦 STATIC
 # ==============================
 STATIC_URL = 'static/'
 
