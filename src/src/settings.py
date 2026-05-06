@@ -19,7 +19,7 @@ AUTH_USER_MODEL = 'user.User'
 # 🔧 APPS
 # ==============================
 INSTALLED_APPS = [
-    'daphne',  # IMPORTANT: keep at top
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -30,7 +30,6 @@ INSTALLED_APPS = [
     # Third-party
     'channels',
     'channels_redis',
-    'django_redis',
     'corsheaders',
     'rest_framework',
     'rest_framework.authtoken',
@@ -80,11 +79,9 @@ TEMPLATES = [
 ASGI_APPLICATION = "src.asgi.application"
 
 # ==============================
-# 🔴 REDIS (SAFE CONFIG)
+# 🔴 REDIS (CHANNELS ONLY)
 # ==============================
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
-
-print("REDIS_URL:", REDIS_URL)  # DEBUG (remove later)
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 
 CHANNEL_LAYERS = {
     "default": {
@@ -95,18 +92,8 @@ CHANNEL_LAYERS = {
     },
 }
 
-CACHES = {
-    "default": {
-        "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": REDIS_URL,
-        "OPTIONS": {
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-        }
-    }
-}
-
 # ==============================
-# 🗄 DATABASE (SQLite OK for now)
+# 🗄 DATABASE
 # ==============================
 DATABASES = {
     'default': {
@@ -154,19 +141,16 @@ CSRF_TRUSTED_ORIGINS = [
 STATIC_URL = 'static/'
 
 # ==============================
-# 🔌 DRF
+# 🔌 DRF (SAFE VERSION)
 # ==============================
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
-    'EXCEPTION_HANDLER': 'utils.exception_handler.custom_exception_handler',
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
-    "DEFAULT_PAGINATION_CLASS": "utils.pagination.StandardPagination",
-    "PAGE_SIZE": 10,
 }
 
 # ==============================
