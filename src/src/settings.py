@@ -114,7 +114,7 @@ DATABASES = {
         'NAME': 'postgres',
         'USER': 'postgres',
         'PASSWORD': 'Lokesh@2907',
-        'HOST': 'db.txwntehmbofsowyhbmun.supabase.co' ,
+        'HOST': 'db.etkbmrrtndgulvcaxgiw.supabase.co' ,
         'PORT': '5432',
         'OPTIONS': {
             'sslmode': 'require',
