@@ -156,17 +156,16 @@ USE_TZ = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    # Add your Vercel production URL below:
-    "https://chat-app-frontend-ncgw-2jkxw5o5n.vercel.app", 
-    # Also add your main project URL if you have one:
-    "https://chat-app-frontend-ncgw.vercel.app",
+
+    # Your actual Vercel frontend
+    "https://chat-app-frontend-hd96dr7de-lokeshwaran1512-gmailcoms-projects.vercel.app",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
 
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
-    "https://chat-app-frontend-ncgw-7ktd614lv.vercel.app",
+    "https://chat-app-frontend-hd96dr7de-lokeshwaran1512-gmailcoms-projects.vercel.app",
 ]
 
 # ==============================
