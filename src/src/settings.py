@@ -111,10 +111,10 @@ CACHES = {
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'neondb',
-        'USER': 'neondb_owner',
-        'PASSWORD': 'npg_tAsEdBLfpZ35',
-        'HOST': 'ep-muddy-sun-aoecemkw.c-2.ap-southeast-1.aws.neon.tech',
+        'NAME': 'postgres',
+        'USER': 'postgres',
+        'PASSWORD': 'Lokesh@2907',
+        'HOST': 'db.thbgajlumozymmfhlyia.supabase.co',
         'PORT': '5432',
         'OPTIONS': {
             'sslmode': 'require',
