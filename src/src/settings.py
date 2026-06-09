@@ -1,8 +1,12 @@
 from pathlib import Path
 from datetime import timedelta
 import os
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load .env from the project root (one level above src/)
+load_dotenv(BASE_DIR.parent / '.env')
 
 # ==============================
 # 🔐 SECURITY
@@ -113,8 +117,8 @@ DATABASES = {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': 'postgres',
         'USER': 'postgres',
-        'PASSWORD': 'Lokesh@2907',
-        'HOST': 'db.etkbmrrtndgulvcaxgiw.supabase.co' ,
+        'PASSWORD': os.getenv("DB_PASSWORD"),
+        'HOST': os.getenv("DB_HOST") ,
         'PORT': '5432',
         'OPTIONS': {
             'sslmode': 'require',
