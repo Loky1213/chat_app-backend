@@ -85,7 +85,7 @@ ASGI_APPLICATION = "src.asgi.application"
 # ==============================
 # 🔴 REDIS (CHANNELS ONLY)
 # ==============================
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+REDIS_URL = os.getenv("REDIS_URL")
 
 CHANNEL_LAYERS = {
     "default": {
