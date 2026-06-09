@@ -17,6 +17,7 @@ from utils.cache import CacheService
 from utils.cache_key import user_profile_key
 
 class RegisterView(APIView):
+    authentication_classes = []
     permission_classes = [AllowAny]
     
     @extend_schema(
@@ -51,6 +52,7 @@ class RegisterView(APIView):
         )
 
 class LoginView(APIView):
+    authentication_classes = []
     permission_classes = [AllowAny]
     
     @extend_schema(
@@ -96,6 +98,7 @@ class LoginView(APIView):
         )
 
 class TokenRefreshView(APIView):
+    authentication_classes = []
     permission_classes = [AllowAny]
     
     @extend_schema(
