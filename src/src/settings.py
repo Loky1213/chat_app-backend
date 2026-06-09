@@ -158,7 +158,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
 
     # Your actual Vercel frontend
-    "https://chat-app-frontend-hd96dr7de-lokeshwaran1512-gmailcoms-projects.vercel.app",
+   "https://chat-app-frontend-f4votsxgv-lokeshwaran1512-gmailcoms-projects.vercel.app",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
